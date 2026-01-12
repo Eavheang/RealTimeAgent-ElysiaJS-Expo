@@ -9,8 +9,8 @@ A real-time voice conversation application built with React Native (Expo) fronte
 ```
 ┌─────────────┐      WebSocket (PCM16 Audio)      ┌─────────────┐
 │   Frontend  │ ────────────────────────────────► │   Backend   │
-│  (React     │                                    │   (Bun +    │
-│   Native)   │ ◄──────────────────────────────── │   Elysia)    │
+│  (React     │                                   │   (Bun +    │
+│   Native)   │ ◄──────────────────────────────── │   Elysia)   │
 └─────────────┘      WebSocket (Base64 Audio)     └─────────────┘
                                                           │
                                                           │ WebSocket
@@ -322,14 +322,3 @@ The conversation follows a strict turn-based flow:
 - Automatic reconnection on WebSocket disconnect
 - Graceful error recovery
 
-## 📄 License
-
-[Your License Here]
-
-## 🤝 Contributing
-
-[Contributing Guidelines]
-
-## 📧 Support
-
-[Support Information]
