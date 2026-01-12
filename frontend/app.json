@@ -1,0 +1,35 @@
+{
+  "expo": {
+    "name": "Voice Agent",
+    "slug": "voice-agent",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.voiceagent.app"
+    },
+    "android": {
+      "package": "com.voiceagent.app",
+      "permissions": [
+        "RECORD_AUDIO"
+      ]
+    },
+    "web": {},
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Allow $(PRODUCT_NAME) to access your microphone for voice communication."
+        }
+      ]
+    ]
+  }
+}
