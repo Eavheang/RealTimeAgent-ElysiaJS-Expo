@@ -119,6 +119,12 @@ export class OpenAIRealtimeConnection {
   // Logger child for this connection
   private log = logger.child({ component: "OpenAIRealtimeConnection" }, { msgPrefix: "[OpenAI] " });
 
+  /**
+   * Track whether the current socket lifecycle already recorded a failure
+   * to avoid double-counting when both `error` and `close` fire.
+   */
+  private failureRecordedForConnection = false;
+
   constructor(
     callbacks: OpenAIRealtimeCallbacks,
     circuitBreakerConfig: Partial<CircuitBreakerConfig> = {},
@@ -128,6 +134,12 @@ export class OpenAIRealtimeConnection {
     this.circuitBreakerConfig = { ...DEFAULT_CIRCUIT_BREAKER, ...circuitBreakerConfig };
     this.reconnectionConfig = { ...DEFAULT_RECONNECTION, ...reconnectionConfig };
   }
+
+  /**
+   * Track whether the current socket lifecycle already recorded a failure
+   * to avoid double-counting when both `error` and `close` fire.
+   */
+  private failureRecordedForConnection = false;
 
   /**
    * Connect to OpenAI Realtime API
@@ -159,6 +171,8 @@ export class OpenAIRealtimeConnection {
     this.shouldReconnect = true;
 
     this.log.info("Connecting to Realtime API...");
+    // New socket lifecycle: reset per-connection failure guard
+    this.failureRecordedForConnection = false;
 
     // Set connection timeout
     this.connectTimeout = setTimeout(() => {
@@ -203,7 +217,10 @@ export class OpenAIRealtimeConnection {
 
     this.ws.on("error", (error: Error) => {
       this.log.error({ error }, "WebSocket error");
-      this.handleConnectionError(error);
+      if (!this.failureRecordedForConnection) {
+        this.failureRecordedForConnection = true;
+        this.handleConnectionError(error);
+      }
       this.callbacks.onError?.(error);
     });
 
@@ -218,7 +235,8 @@ export class OpenAIRealtimeConnection {
       this.isConnected = false;
 
       // Handle unexpected disconnection (not due to disconnect() call)
-      if (this.shouldReconnect) {
+      if (this.shouldReconnect && !this.failureRecordedForConnection) {
+        this.failureRecordedForConnection = true;
         this.handleConnectionError(new Error("Unexpected disconnection"));
       }
 
@@ -419,6 +437,7 @@ export class OpenAIRealtimeConnection {
    * Handle connection errors with circuit breaker and reconnection
    */
   private handleConnectionError(error: Error): void {
+    this.failureRecordedForConnection = true;
     this.isConnected = false;
     this.failureCount++;
     this.lastFailureTime = Date.now();

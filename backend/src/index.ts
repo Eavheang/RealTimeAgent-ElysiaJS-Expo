@@ -70,6 +70,10 @@ interface WebSocketConnectionData {
   isAuthenticated: boolean;
   isClosing: boolean; // Flag to prevent sends during close
   logger: Logger; // Connection-specific logger
+  // Handshake metadata captured during upgrade
+  authToken?: string | null;
+  url?: string;
+  query?: Record<string, string | undefined>;
 }
 
 const app = new Elysia();
@@ -108,10 +112,26 @@ const MIN_AUDIO_PACKET_SIZE = 64;
 
 // WebSocket endpoint for voice agent
 app.ws("/ws", {
+  // Capture request metadata during upgrade so it is available in `open`
+  upgrade(context) {
+    const requestUrl = context.request.url;
+
+    return {
+      url: requestUrl,
+      query: context.query,
+      authToken: extractAuthToken(requestUrl),
+    } satisfies Partial<WebSocketConnectionData>;
+  },
+
   // Handle new client connection
   open(ws: any) {
-    // Extract and validate auth token
-    const authToken = extractAuthToken(ws.raw.url);
+    const handshakeData = (ws.data || {}) as Partial<WebSocketConnectionData>;
+
+    // Prefer token captured during upgrade, then query token, then URL parsing
+    const authToken =
+      handshakeData.authToken ??
+      handshakeData.query?.token ??
+      extractAuthToken(handshakeData.url ?? null);
     const isAuthenticated = validateAuthToken(authToken);
 
     if (!isAuthenticated) {
@@ -130,12 +150,15 @@ app.ws("/ws", {
     // Create connection-specific logger
     const connLogger = createConnectionLogger(connId);
 
-    // Store connection data with proper typing
+    // Store connection data with proper typing (include handshake metadata)
     const connectionData: WebSocketConnectionData = {
       connId,
       isAuthenticated,
       isClosing: false,
       logger: connLogger,
+      authToken,
+      url: handshakeData.url,
+      query: handshakeData.query,
     };
     (ws.data as WebSocketConnectionData) = connectionData;
 
@@ -457,4 +480,3 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     }
   });
 }
-
