@@ -3,7 +3,7 @@
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { BACKEND_WS_URL } from "../utils/config";
+import { getWebSocketUrl } from "../utils/config";
 import { ConnectionState, BackendMessage } from "../types/websocket";
 
 interface UseWebSocketReturn {
@@ -51,11 +51,12 @@ export function useWebSocket(
       wsRef.current = null;
     }
 
-    console.log("[WebSocket] Connecting to:", BACKEND_WS_URL);
+    const wsUrl = getWebSocketUrl();
+    console.log("[WebSocket] Connecting to:", wsUrl);
     setConnectionState("connecting");
 
     try {
-      const ws = new WebSocket(BACKEND_WS_URL);
+      const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
         console.log("[WebSocket] Connected");

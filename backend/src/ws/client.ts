@@ -6,6 +6,7 @@
 import { VAD } from "../audio/vad";
 import { AgentStateMachine, AgentState } from "../agent/state";
 import { OpenAIRealtimeConnection } from "./openai";
+import { MAX_AUDIO_BUFFER_BYTES } from "../config";
 
 /**
  * Per-connection client handler
@@ -15,6 +16,7 @@ export class ClientHandler {
   private stateMachine: AgentStateMachine;
   private openai: OpenAIRealtimeConnection | null = null;
   private audioBuffer: Buffer[] = [];
+  private totalBufferSize = 0; // Track total buffer size in bytes
   private sendToClient: (data: string) => void;
   private isOpenAIConnected = false;
 
@@ -22,6 +24,21 @@ export class ClientHandler {
     this.sendToClient = sendToClient;
     this.vad = new VAD();
     this.stateMachine = new AgentStateMachine();
+  }
+
+  /**
+   * Check if adding a chunk would exceed the buffer size limit
+   */
+  private wouldExceedBufferLimit(chunkSize: number): boolean {
+    return this.totalBufferSize + chunkSize > MAX_AUDIO_BUFFER_BYTES;
+  }
+
+  /**
+   * Reset audio buffer and size tracking
+   */
+  private resetAudioBuffer(): void {
+    this.audioBuffer = [];
+    this.totalBufferSize = 0;
   }
 
   /**
@@ -43,7 +60,7 @@ export class ClientHandler {
       onError: (error: Error) => {
         console.error("[ClientHandler] OpenAI error:", error);
         this.stateMachine.reset();
-        this.audioBuffer = [];
+        this.resetAudioBuffer();
       },
       onConnected: () => {
         console.log("[ClientHandler] OpenAI connected");
@@ -118,14 +135,25 @@ export class ClientHandler {
    * Process audio: buffer and send to OpenAI
    */
   private processAudio(audioBuffer: Buffer): void {
+    // Check buffer size limit
+    if (this.wouldExceedBufferLimit(audioBuffer.length)) {
+      console.warn(
+        `[ClientHandler] Buffer limit exceeded (${this.totalBufferSize} + ${audioBuffer.length} > ${MAX_AUDIO_BUFFER_BYTES}), resetting`
+      );
+      this.resetAudioBuffer();
+      this.stateMachine.transitionTo(AgentState.IDLE);
+      return;
+    }
+
     // Transition to LISTENING if we're IDLE
     if (this.stateMachine.is(AgentState.IDLE)) {
       this.stateMachine.transitionTo(AgentState.LISTENING);
-      this.audioBuffer = [];
+      this.resetAudioBuffer();
     }
 
-    // Buffer the audio
+    // Buffer the audio and track size
     this.audioBuffer.push(audioBuffer);
+    this.totalBufferSize += audioBuffer.length;
 
     // Send to OpenAI for VAD processing
     if (this.openai && this.isOpenAIConnected) {
@@ -141,7 +169,7 @@ export class ClientHandler {
     if (!this.openai || !this.isOpenAIConnected) return;
 
     // Check minimum audio buffer size
-    const totalSize = this.audioBuffer.reduce((sum, buf) => sum + buf.length, 0);
+    const totalSize = this.totalBufferSize;
     if (totalSize < 3200) {
       console.log(`[ClientHandler] Audio too short (${totalSize} bytes), ignoring`);
       return;
@@ -189,7 +217,7 @@ export class ClientHandler {
       
       // Transition to IDLE
       this.stateMachine.transitionTo(AgentState.IDLE);
-      this.audioBuffer = [];
+      this.resetAudioBuffer();
       this.vad.reset();
 
       // Clear OpenAI's input buffer for fresh start
@@ -212,7 +240,7 @@ export class ClientHandler {
     }
     this.isOpenAIConnected = false;
     this.vad.reset();
-    this.audioBuffer = [];
+    this.resetAudioBuffer();
   }
 
   getState(): AgentState {

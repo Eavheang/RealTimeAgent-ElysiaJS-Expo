@@ -47,21 +47,91 @@ export interface OpenAIRealtimeCallbacks {
 }
 
 /**
+ * Circuit breaker states
+ */
+enum CircuitBreakerState {
+  CLOSED = "CLOSED", // Normal operation, requests flow through
+  OPEN = "OPEN", // Circuit is open, requests are blocked
+  HALF_OPEN = "HALF_OPEN", // Testing if the service has recovered
+}
+
+/**
+ * Circuit breaker configuration
+ */
+interface CircuitBreakerConfig {
+  failureThreshold: number; // Number of failures before opening
+  resetTimeoutMs: number; // How long to wait before trying again
+}
+
+/**
+ * Reconnection configuration
+ */
+interface ReconnectionConfig {
+  maxAttempts: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  backoffMultiplier: number;
+  jitterMs: number;
+}
+
+const DEFAULT_CIRCUIT_BREAKER: CircuitBreakerConfig = {
+  failureThreshold: 5,
+  resetTimeoutMs: 60000, // 1 minute
+};
+
+const DEFAULT_RECONNECTION: ReconnectionConfig = {
+  maxAttempts: 10,
+  initialDelayMs: 1000,
+  maxDelayMs: 30000,
+  backoffMultiplier: 2,
+  jitterMs: 500, // Random jitter to prevent thundering herd
+};
+
+/**
  * OpenAI Realtime WebSocket wrapper
+ * Includes exponential backoff reconnection and circuit breaker
  */
 export class OpenAIRealtimeConnection {
   private ws: WebSocket | null = null;
   private callbacks: OpenAIRealtimeCallbacks;
-  private isConnected = false;
+  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+  private connectTimeout: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(callbacks: OpenAIRealtimeCallbacks) {
+  // Reconnection state
+  private reconnectAttempts = 0;
+  private isReconnecting = false;
+  private shouldReconnect = false;
+
+  // Circuit breaker state
+  private circuitBreakerState = CircuitBreakerState.CLOSED;
+  private failureCount = 0;
+  private lastFailureTime = 0;
+  private circuitBreakerConfig: CircuitBreakerConfig;
+  private reconnectionConfig: ReconnectionConfig;
+
+  // Connection timeout
+  private connectionTimeoutMs = 15000; // 15 seconds to establish connection
+
+  constructor(
+    callbacks: OpenAIRealtimeCallbacks,
+    circuitBreakerConfig: Partial<CircuitBreakerConfig> = {},
+    reconnectionConfig: Partial<ReconnectionConfig> = {}
+  ) {
     this.callbacks = callbacks;
+    this.circuitBreakerConfig = { ...DEFAULT_CIRCUIT_BREAKER, ...circuitBreakerConfig };
+    this.reconnectionConfig = { ...DEFAULT_RECONNECTION, ...reconnectionConfig };
   }
 
   /**
    * Connect to OpenAI Realtime API
    */
   connect(): void {
+    // Check circuit breaker state
+    if (!this.canAttemptConnection()) {
+      console.warn("[OpenAI] Cannot connect: circuit breaker is open");
+      return;
+    }
+
     // Prevent multiple simultaneous connections
     if (this.ws?.readyState === WebSocket.OPEN) {
       console.warn("[OpenAI] Already connected to OpenAI, skipping");
@@ -79,7 +149,15 @@ export class OpenAIRealtimeConnection {
       this.disconnect();
     }
 
+    this.shouldReconnect = true;
+
     console.log("[OpenAI] Connecting to OpenAI Realtime API...");
+
+    // Set connection timeout
+    this.connectTimeout = setTimeout(() => {
+      console.error("[OpenAI] Connection timeout");
+      this.handleConnectionError(new Error("Connection timeout"));
+    }, this.connectionTimeoutMs);
 
     // Add model as query parameter to the URL
     const urlWithModel = `${OPENAI_REALTIME_URL}?model=${OPENAI_MODEL}`;
@@ -92,8 +170,17 @@ export class OpenAIRealtimeConnection {
     });
 
     this.ws.on("open", () => {
+      // Clear connection timeout
+      if (this.connectTimeout) {
+        clearTimeout(this.connectTimeout);
+        this.connectTimeout = null;
+      }
+
       console.log("[OpenAI] Connected to OpenAI Realtime API");
       this.isConnected = true;
+      this.resetCircuitBreaker();
+      this.reconnectAttempts = 0;
+      this.isReconnecting = false;
       this.initializeSession();
       this.callbacks.onConnected?.();
     });
@@ -109,12 +196,25 @@ export class OpenAIRealtimeConnection {
 
     this.ws.on("error", (error: Error) => {
       console.error("[OpenAI] WebSocket error:", error);
+      this.handleConnectionError(error);
       this.callbacks.onError?.(error);
     });
 
     this.ws.on("close", () => {
+      // Clear connection timeout
+      if (this.connectTimeout) {
+        clearTimeout(this.connectTimeout);
+        this.connectTimeout = null;
+      }
+
       console.log("[OpenAI] Disconnected from OpenAI Realtime API");
       this.isConnected = false;
+
+      // Handle unexpected disconnection (not due to disconnect() call)
+      if (this.shouldReconnect) {
+        this.handleConnectionError(new Error("Unexpected disconnection"));
+      }
+
       this.callbacks.onDisconnected?.();
     });
   }
@@ -285,12 +385,152 @@ export class OpenAIRealtimeConnection {
 
   /**
    * Disconnect from OpenAI
+   * Stops any pending reconnection attempts
    */
   disconnect(): void {
+    this.shouldReconnect = false;
+    this.isReconnecting = false;
+
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+
+    if (this.connectTimeout) {
+      clearTimeout(this.connectTimeout);
+      this.connectTimeout = null;
+    }
+
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
     this.isConnected = false;
+  }
+
+  /**
+   * Handle connection errors with circuit breaker and reconnection
+   */
+  private handleConnectionError(error: Error): void {
+    this.isConnected = false;
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+
+    console.error("[OpenAI] Connection error:", {
+      message: error.message,
+      attempt: this.reconnectAttempts,
+      failureCount: this.failureCount,
+      circuitBreakerState: this.circuitBreakerState,
+    });
+
+    // Update circuit breaker state
+    if (this.failureCount >= this.circuitBreakerConfig.failureThreshold) {
+      this.openCircuitBreaker();
+    }
+
+    // Try to reconnect if enabled and within limits
+    if (this.shouldReconnect && this.reconnectAttempts < this.reconnectionConfig.maxAttempts) {
+      this.scheduleReconnection();
+    } else if (this.reconnectAttempts >= this.reconnectionConfig.maxAttempts) {
+      console.error("[OpenAI] Max reconnection attempts reached. Giving up.");
+      this.callbacksWithErrorInfo(new Error("Max reconnection attempts reached. Giving up."));
+    }
+  }
+
+  /**
+   * Schedule a reconnection attempt with exponential backoff
+   */
+  private scheduleReconnection(): void {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+
+    // Check circuit breaker
+    if (!this.canAttemptConnection()) {
+      const cooldownEnd = this.lastFailureTime + this.circuitBreakerConfig.resetTimeoutMs;
+      const cooldownRemaining = Math.max(0, cooldownEnd - Date.now());
+      console.log(
+        `[OpenAI] Circuit breaker is open. Scheduling reconnection in ${cooldownRemaining}ms`
+      );
+      this.reconnectTimeout = setTimeout(() => {
+        this.circuitBreakerState = CircuitBreakerState.HALF_OPEN;
+        this.attemptReconnection();
+      }, cooldownRemaining);
+      return;
+    }
+
+    // Calculate delay with exponential backoff and jitter
+    const baseDelay = Math.min(
+      this.reconnectionConfig.initialDelayMs * Math.pow(this.reconnectionConfig.backoffMultiplier, this.reconnectAttempts),
+      this.reconnectionConfig.maxDelayMs
+    );
+    const jitter = Math.random() * this.reconnectionConfig.jitterMs * 2 - this.reconnectionConfig.jitterMs;
+    const delay = Math.max(0, baseDelay + jitter);
+
+    this.isReconnecting = true;
+    this.reconnectAttempts++;
+
+    console.log(
+      `[OpenAI] Scheduling reconnection attempt ${this.reconnectAttempts}/${this.reconnectionConfig.maxAttempts} in ${Math.round(delay)}ms`
+    );
+
+    this.reconnectTimeout = setTimeout(() => {
+      this.attemptReconnection();
+    }, delay);
+  }
+
+  /**
+   * Attempt to reconnect
+   */
+  private attemptReconnection(): void {
+    if (this.shouldReconnect) {
+      console.log(`[OpenAI] Reconnection attempt ${this.reconnectAttempts}`);
+      this.connect();
+    }
+  }
+
+  /**
+   * Open the circuit breaker to prevent further connection attempts
+   */
+  private openCircuitBreaker(): void {
+    this.circuitBreakerState = CircuitBreakerState.OPEN;
+    this.lastFailureTime = Date.now();
+    console.warn(
+      `[OpenAI] Circuit breaker opened after ${this.failureCount} failures. Next attempt after ${this.circuitBreakerConfig.resetTimeoutMs}ms`
+    );
+  }
+
+  /**
+   * Reset the circuit breaker on successful connection
+   */
+  private resetCircuitBreaker(): void {
+    if (this.circuitBreakerState !== CircuitBreakerState.CLOSED) {
+      console.log("[OpenAI] Circuit breaker reset to CLOSED");
+    }
+    this.circuitBreakerState = CircuitBreakerState.CLOSED;
+    this.failureCount = 0;
+  }
+
+  /**
+   * Check if a connection attempt can be made based on circuit breaker state
+   */
+  private canAttemptConnection(): boolean {
+    if (this.circuitBreakerState === CircuitBreakerState.CLOSED) {
+      return true;
+    }
+
+    if (this.circuitBreakerState === CircuitBreakerState.OPEN) {
+      const timeSinceLastFailure = Date.now() - this.lastFailureTime;
+      return timeSinceLastFailure >= this.circuitBreakerConfig.resetTimeoutMs;
+    }
+
+    return true; // HALF_OPEN allows connections
+  }
+
+  /**
+   * Callback helper that includes circuit breaker state in error info
+   */
+  private callbacksWithErrorInfo(error: Error): void {
+    this.callbacks.onError?.(error);
   }
 }
