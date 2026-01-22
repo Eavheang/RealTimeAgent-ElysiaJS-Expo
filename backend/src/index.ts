@@ -28,7 +28,8 @@ function extractAuthToken(url: string | null): string | null {
   try {
     const urlObj = new URL(url, "http://dummy");
     return urlObj.searchParams.get("token");
-  } catch {
+  } catch (error) {
+    logger.debug({ error }, "Failed to parse auth token from URL");
     return null;
   }
 }
@@ -108,15 +109,16 @@ const MIN_AUDIO_PACKET_SIZE = 64;
 // WebSocket endpoint for voice agent
 app.ws("/ws", {
   // Handle new client connection
-  open(ws) {
+  open(ws: any) {
     // Extract and validate auth token
     const authToken = extractAuthToken(ws.raw.url);
     const isAuthenticated = validateAuthToken(authToken);
 
     if (!isAuthenticated) {
-      logger.warn("Rejecting unauthorized connection", {
-        reason: authToken ? "invalid_token" : "no_token",
-      });
+      logger.warn(
+        { reason: authToken ? "invalid_token" : "no_token" },
+        "Rejecting unauthorized connection"
+      );
       // Close with policy violation (1008) - unauthorized
       ws.close(1008, "Unauthorized: Invalid or missing authentication token");
       return;
@@ -140,11 +142,14 @@ app.ws("/ws", {
     // Store WebSocket reference for safe sending
     webSockets.set(connId, ws.raw);
 
-    connLogger.info("Client connected", {
-      isAuthenticated,
-      readyState: ws.readyState,
-      totalConnections: clientHandlers.size + 1,
-    });
+    connLogger.info(
+      {
+        isAuthenticated,
+        readyState: ws.readyState,
+        totalConnections: clientHandlers.size + 1,
+      },
+      "Client connected"
+    );
 
     // Create per-connection rate limiter
     const rateLimiter = createRateLimiter();
@@ -168,7 +173,7 @@ app.ws("/ws", {
         ws.send(data);
         return true;
       } catch (error) {
-        connLogger.error("Error sending message", { error });
+        connLogger.error({ error }, "Error sending message");
         return false;
       }
     };
@@ -182,7 +187,7 @@ app.ws("/ws", {
   },
 
   // Handle incoming messages from client
-  message(ws, message) {
+  message(ws: any, message) {
     // Retrieve connection data with proper typing
     const connectionData = ws.data as WebSocketConnectionData | undefined;
     const connId = connectionData?.connId;
@@ -201,19 +206,20 @@ app.ws("/ws", {
 
     // Check rate limit
     if (rateLimiter && !rateLimiter.allow()) {
-      connLogger.warn("Rate limit exceeded", {
-        resetTime: rateLimiter.getResetTime(),
-      });
+      connLogger.warn(
+        { resetTime: rateLimiter.getResetTime() },
+        "Rate limit exceeded"
+      );
       // Close with policy violation (1008)
       ws.close(1008, "Rate limit exceeded. Please slow down.");
       return;
     }
 
     if (!clientHandler) {
-      logger.error("No handler found for connection", {
-        connectionId: connId,
-        mapSize: clientHandlers.size,
-      });
+      logger.error(
+        { connectionId: connId, mapSize: clientHandlers.size },
+        "No handler found for connection"
+      );
       return;
     }
 
@@ -238,29 +244,32 @@ app.ws("/ws", {
 
       // DoS protection: reject oversized packets
       if (audioBuffer.length > MAX_AUDIO_PACKET_BYTES) {
-        connLogger.warn("Oversized audio packet rejected", {
-          packetSize: audioBuffer.length,
-          maxAllowed: MAX_AUDIO_PACKET_BYTES,
-        });
+        connLogger.warn(
+          {
+            packetSize: audioBuffer.length,
+            maxAllowed: MAX_AUDIO_PACKET_BYTES,
+          },
+          "Oversized audio packet rejected"
+        );
         ws.close(1008, `Packet too large: ${audioBuffer.length} bytes (max: ${MAX_AUDIO_PACKET_BYTES})`);
         return;
       }
 
-      connLogger.debug("Received audio chunk", { bytes: audioBuffer.length });
+      connLogger.debug({ bytes: audioBuffer.length }, "Received audio chunk");
 
       // Forward to client handler
       clientHandler.handleAudioChunk(audioBuffer);
 
     } else if (typeof message === "string") {
       // Handle text messages (for future use, e.g., control messages)
-      connLogger.info("Received text message", { message });
+      connLogger.info({ message }, "Received text message");
     } else {
-      connLogger.warn("Received unknown message type", { type: typeof message });
+      connLogger.warn({ type: typeof message }, "Received unknown message type");
     }
   },
 
   // Handle client disconnect
-  close(ws) {
+  close(ws: any) {
     // Retrieve connection data with proper typing
     const connectionData = ws.data as WebSocketConnectionData | undefined;
     const connId = connectionData?.connId;
@@ -272,73 +281,69 @@ app.ws("/ws", {
     }
 
     // WebSocket close code meanings (RFC 6455)
-    const closeCode = ws.code;
-    const closeReason = ws.reason || "No reason provided";
+    const closeCode = ws.raw.code;
+    const closeReason = ws.raw.reason || "No reason provided";
     let closeDescription = "Unknown close";
 
     switch (closeCode) {
       case 1000: // Normal Closure
         closeDescription = "Normal close";
-        connLogger.info("Client disconnected normally", { code: closeCode, reason: closeReason });
+        connLogger.info({ code: closeCode, reason: closeReason }, "Client disconnected normally");
         break;
       case 1001: // Going Away
         closeDescription = "Client going away (server shutdown, navigation)";
-        connLogger.info("Client disconnected (going away)", { code: closeCode, reason: closeReason });
+        connLogger.info({ code: closeCode, reason: closeReason }, "Client disconnected (going away)");
         break;
       case 1002: // Protocol Error
         closeDescription = "Protocol error";
-        connLogger.warn("Client disconnected (protocol error)", { code: closeCode, reason: closeReason });
+        connLogger.warn({ code: closeCode, reason: closeReason }, "Client disconnected (protocol error)");
         break;
       case 1003: // Unsupported Data
         closeDescription = "Unsupported data type";
-        connLogger.warn("Client disconnected (unsupported data)", { code: closeCode, reason: closeReason });
+        connLogger.warn({ code: closeCode, reason: closeReason }, "Client disconnected (unsupported data)");
         break;
       case 1005: // No Status Received
         closeDescription = "No status received (abnormal close)";
-        connLogger.warn("Client disconnected abnormally", { code: closeCode });
+        connLogger.warn({ code: closeCode }, "Client disconnected abnormally");
         break;
       case 1006: // Abnormal Closure
         closeDescription = "Abnormal closure (network issue)";
-        connLogger.warn("Client disconnected (abnormal close, possible network issue)", { code: closeCode });
+        connLogger.warn({ code: closeCode }, "Client disconnected (abnormal close, possible network issue)");
         break;
       case 1007: // Invalid frame payload data
         closeDescription = "Invalid payload data";
-        connLogger.warn("Client disconnected (invalid payload)", { code: closeCode, reason: closeReason });
+        connLogger.warn({ code: closeCode, reason: closeReason }, "Client disconnected (invalid payload)");
         break;
       case 1008: // Policy Violation
         closeDescription = "Policy violation";
-        connLogger.info("Client disconnected (policy violation - likely auth/rate limit)", { code: closeCode, reason: closeReason });
+        connLogger.info({ code: closeCode, reason: closeReason }, "Client disconnected (policy violation - likely auth/rate limit)");
         break;
       case 1009: // Message Too Big
         closeDescription = "Message too large";
-        connLogger.warn("Client disconnected (message too large)", { code: closeCode, reason: closeReason });
+        connLogger.warn({ code: closeCode, reason: closeReason }, "Client disconnected (message too large)");
         break;
       case 1010: // Missing Extension
         closeDescription = "Missing extension";
-        connLogger.warn("Client disconnected (missing extension)", { code: closeCode, reason: closeReason });
+        connLogger.warn({ code: closeCode, reason: closeReason }, "Client disconnected (missing extension)");
         break;
       case 1011: // Internal Error
         closeDescription = "Internal server error";
-        connLogger.error("Client disconnected (internal error)", { code: closeCode, reason: closeReason });
+        connLogger.error({ code: closeCode, reason: closeReason }, "Client disconnected (internal error)");
         break;
       case 1012: // Service Restart
         closeDescription = "Service restart";
-        connLogger.info("Client disconnected (service restart)", { code: closeCode, reason: closeReason });
+        connLogger.info({ code: closeCode, reason: closeReason }, "Client disconnected (service restart)");
         break;
       case 1013: // Try Again Later
         closeDescription = "Try again later";
-        connLogger.info("Client disconnected (try again later)", { code: closeCode, reason: closeReason });
+        connLogger.info({ code: closeCode, reason: closeReason }, "Client disconnected (try again later)");
         break;
       case 1015: // TLS Handshake
         closeDescription = "TLS handshake failure";
-        connLogger.error("Client disconnected (TLS handshake failed)", { code: closeCode, reason: closeReason });
+        connLogger.error({ code: closeCode, reason: closeReason }, "Client disconnected (TLS handshake failed)");
         break;
       default:
-        connLogger.info("Client disconnected", {
-          code: closeCode,
-          reason: closeReason,
-          description: closeDescription,
-        });
+        connLogger.info({ code: closeCode, reason: closeReason, description: closeDescription }, "Client disconnected");
     }
 
     // Mark connection as closing to prevent further sends
@@ -394,7 +399,7 @@ const gracefulShutdown = (signal: string): void => {
     try {
       handler.markAsClosing();
     } catch (error) {
-      logger.error("Error marking handler as closing", { connectionId: connId, error });
+      logger.error({ connectionId: connId, error }, "Error marking handler as closing");
     }
   }
 
@@ -406,7 +411,7 @@ const gracefulShutdown = (signal: string): void => {
     try {
       ws.close(1001, "Server shutting down");
     } catch (error) {
-      logger.error("Error closing WebSocket", { connectionId: connId, error });
+      logger.error({ connectionId: connId, error }, "Error closing WebSocket");
     }
   }
 
@@ -418,7 +423,7 @@ const gracefulShutdown = (signal: string): void => {
     try {
       handler.cleanup();
     } catch (error) {
-      logger.error("Error cleaning up handler", { connectionId: connId, error });
+      logger.error({ connectionId: connId, error }, "Error cleaning up handler");
     }
   }
 
@@ -446,7 +451,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     try {
       gracefulShutdown(signal);
     } catch (error) {
-      logger.error("Error during graceful shutdown", { error });
+      logger.error({ error }, "Error during graceful shutdown");
       clearTimeout(timeout);
       process.exit(1);
     }

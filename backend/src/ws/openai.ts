@@ -98,6 +98,9 @@ export class OpenAIRealtimeConnection {
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private connectTimeout: ReturnType<typeof setTimeout> | null = null;
 
+  // Connection state
+  private isConnected = false;
+
   // Reconnection state
   private reconnectAttempts = 0;
   private isReconnecting = false;
@@ -194,12 +197,12 @@ export class OpenAIRealtimeConnection {
         const message = JSON.parse(data.toString()) as OpenAIRealtimeMessage;
         this.handleMessage(message);
       } catch (error) {
-        this.log.error("Error parsing message", { error });
+        this.log.error({ error }, "Error parsing message");
       }
     });
 
     this.ws.on("error", (error: Error) => {
-      this.log.error("WebSocket error", { error });
+      this.log.error({ error }, "WebSocket error");
       this.handleConnectionError(error);
       this.callbacks.onError?.(error);
     });
@@ -286,16 +289,16 @@ export class OpenAIRealtimeConnection {
       case "error":
         // Ignore empty buffer commit errors (benign)
         if (message.error.code === "input_audio_buffer_commit_empty") {
-          this.log.warn("Empty buffer commit error", { message: message.error.message });
+          this.log.warn({ message: message.error.message }, "Empty buffer commit error");
           return;
         }
 
         if (message.error.code === "conversation_already_has_active_response") {
-          this.log.warn("Already has active response", { message: message.error.message });
+          this.log.warn({ message: message.error.message }, "Already has active response");
           return;
         }
 
-        this.log.error("API error", { error: message.error });
+        this.log.error({ error: message.error }, "API error");
         this.callbacks.onError?.(new Error(`${message.error.code}: ${message.error.message}`));
         break;
 
@@ -306,7 +309,7 @@ export class OpenAIRealtimeConnection {
 
       default:
         // Log unhandled message types for debugging
-        this.log.debug("Received message type", { type: messageType });
+        this.log.debug({ type: messageType }, "Received message type");
         break;
     }
   }
@@ -420,12 +423,15 @@ export class OpenAIRealtimeConnection {
     this.failureCount++;
     this.lastFailureTime = Date.now();
 
-    this.log.error("Connection error", {
-      message: error.message,
-      attempt: this.reconnectAttempts,
-      failureCount: this.failureCount,
-      circuitBreakerState: this.circuitBreakerState,
-    });
+    this.log.error(
+      {
+        message: error.message,
+        attempt: this.reconnectAttempts,
+        failureCount: this.failureCount,
+        circuitBreakerState: this.circuitBreakerState,
+      },
+      "Connection error"
+    );
 
     // Update circuit breaker state
     if (this.failureCount >= this.circuitBreakerConfig.failureThreshold) {

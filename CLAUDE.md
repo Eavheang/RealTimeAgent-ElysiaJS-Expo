@@ -45,7 +45,7 @@ backend/
 │   │   ├── prompt.ts      # System prompt for AI
 │   │   └── state.ts       # State machine (IDLE/LISTENING/THINKING/SPEAKING)
 │   ├── audio/
-│   │   └── vad.ts         # Voice Activity Detection
+│   │   └── vad.ts         # Voice Activity Detection (unused - reserved for future client-side VAD)
 │   ├── types/
 │   │   ├── config.ts      # Type definitions for config
 │   │   └── index.ts       # Type barrel export
@@ -121,6 +121,7 @@ private SPEECH_COOLDOWN_MS = 300;
 // Track timing
 private speechStartedTime: number | null = null;
 private speechEndedTime: number | null = null;
+private speechConfirmationTimeout: ReturnType<typeof setTimeout> | null = null;
 ```
 
 **Safe Send Pattern (WebSocket):**
@@ -217,6 +218,13 @@ WAV_HEADER_CACHE.set(cacheKey, headerWithZeroLength);
 
 <!-- AUTO-MANAGED: git-insights -->
 ## Git History Insights
+
+**Commit 82cd8b6: Frontend - Optimize audio performance and fix closure state issues**
+- Implemented stale closure prevention pattern using refs for conversationState and isSessionActive in VoiceScreen.tsx
+- Added chunked audio processing (32KB chunks) in useAudioRecording.ts for better cache locality
+- Optimized base64 to ArrayBuffer conversion with chunked processing in audioUtils.ts
+- Added WAV header caching in AudioPlayer.tsx to avoid recreating identical headers
+- Optimized Uint8Array to Base64 conversion with chunk processing to avoid call stack limits
 
 **Commit 06050aa: Phase 2-6 - Logging, bug fixes, performance optimization, and types**
 - Added Pino logging library with pretty printing for dev, JSON for prod

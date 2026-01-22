@@ -7,7 +7,7 @@ import type { Logger } from "pino";
 import { VAD } from "../audio/vad";
 import { AgentStateMachine, AgentState } from "../agent/state";
 import { OpenAIRealtimeConnection } from "./openai";
-import { MAX_AUDIO_BUFFER_BYTES } from "../config";
+import { MAX_AUDIO_BUFFER_BYTES, MIN_AUDIO_COMMIT_BYTES } from "../config";
 
 /**
  * Per-connection client handler
@@ -27,6 +27,7 @@ export class ClientHandler {
   // VAD debouncing state
   private speechStartedTime: number | null = null;
   private speechEndedTime: number | null = null;
+  private speechConfirmationTimeout: ReturnType<typeof setTimeout> | null = null;
   private readonly SPEAKING_CONFIRMATION_MS = 200; // Require 200ms of speech to confirm
   private readonly SPEECH_COOLDOWN_MS = 300; // Wait 300ms after speech ends before accepting new speech
 
@@ -69,6 +70,10 @@ export class ClientHandler {
   private resetVADDebouncingState(): void {
     this.speechStartedTime = null;
     this.speechEndedTime = null;
+    if (this.speechConfirmationTimeout) {
+      clearTimeout(this.speechConfirmationTimeout);
+      this.speechConfirmationTimeout = null;
+    }
   }
 
   /**
@@ -76,6 +81,11 @@ export class ClientHandler {
    */
   markAsClosing(): void {
     this.isClosing = true;
+    // Clear confirmation timeout to prevent callbacks on disposed handler
+    if (this.speechConfirmationTimeout) {
+      clearTimeout(this.speechConfirmationTimeout);
+      this.speechConfirmationTimeout = null;
+    }
   }
 
   /**
@@ -115,7 +125,7 @@ export class ClientHandler {
         this.handleResponseCompleted();
       },
       onError: (error: Error) => {
-        this.logger.error("OpenAI error", { error });
+        this.logger.error({ error }, "OpenAI error");
         this.stateMachine.reset();
         this.resetAudioBuffer();
       },
@@ -135,10 +145,13 @@ export class ClientHandler {
 
         // VAD deouncing: Check cooldown period
         if (this.speechEndedTime && (now - this.speechEndedTime < this.SPEECH_COOLDOWN_MS)) {
-          this.logger.debug("Ignoring speech_started (cooldown)", {
-            timeSinceEnd: now - this.speechEndedTime,
-            cooldown: this.SPEECH_COOLDOWN_MS,
-          });
+          this.logger.debug(
+            {
+              timeSinceEnd: now - this.speechEndedTime,
+              cooldown: this.SPEECH_COOLDOWN_MS,
+            },
+            "Ignoring speech_started (cooldown)"
+          );
           return;
         }
 
@@ -147,10 +160,16 @@ export class ClientHandler {
           // Track speech start for confirmation debouncing
           this.speechStartedTime = now;
 
+          // Clear any existing confirmation timeout
+          if (this.speechConfirmationTimeout) {
+            clearTimeout(this.speechConfirmationTimeout);
+          }
+
           // Confirmation debouncing: require speech to last > SPEAKING_CONFIRMATION_MS
           // We'll transition to LISTENING on confirmation
-          setTimeout(() => {
-            if (this.speechStartedTime === now && this.stateMachine.is(AgentState.IDLE)) {
+          this.speechConfirmationTimeout = setTimeout(() => {
+            this.speechConfirmationTimeout = null;
+            if (this.speechStartedTime === now && this.stateMachine.is(AgentState.IDLE) && !this.isClosing) {
               // Still in speech started state, confirm speech is real
               this.logger.info("Speech confirmed, transitioning to LISTENING");
               this.stateMachine.transitionTo(AgentState.LISTENING);
@@ -162,7 +181,7 @@ export class ClientHandler {
           this.speechStartedTime = null; // No longer debouncing
         } else {
           // THINKING or SPEAKING - ignore speech events
-          this.logger.debug("Ignoring speech_started", { state });
+          this.logger.debug({ state }, "Ignoring speech_started");
         }
       },
       onSpeechStopped: () => {
@@ -179,13 +198,14 @@ export class ClientHandler {
           this.triggerResponse();
         } else if (state === AgentState.IDLE && this.speechStartedTime) {
           // Speech started but never confirmed - this was a false positive (noise pop)
-          this.logger.debug("Rejected brief speech (false positive)", {
-            duration: now - this.speechStartedTime,
-          });
+          this.logger.debug(
+            { duration: now - this.speechStartedTime },
+            "Rejected brief speech (false positive)"
+          );
           this.resetAudioBuffer();
           this.speechStartedTime = null;
         } else {
-          this.logger.debug("Ignoring speech_stopped", { state });
+          this.logger.debug({ state }, "Ignoring speech_stopped");
         }
       },
     });
@@ -202,7 +222,7 @@ export class ClientHandler {
     const bufferSize = this.writeOffset;
     if (bufferSize === 0) return;
 
-    this.logger.info("Flushing buffered audio", { bytes: bufferSize });
+    this.logger.info({ bytes: bufferSize }, "Flushing buffered audio");
 
     // Slice the buffer to get actual data and send to OpenAI
     const actualData = this.audioBuffer.subarray(0, bufferSize);
@@ -234,11 +254,14 @@ export class ClientHandler {
   private processAudio(audioBuffer: Buffer): void {
     // Check buffer size limit
     if (this.wouldExceedBufferLimit(audioBuffer.length)) {
-      this.logger.warn("Buffer limit exceeded, resetting", {
-        currentSize: this.writeOffset,
-        chunkSize: audioBuffer.length,
-        maxSize: MAX_AUDIO_BUFFER_BYTES,
-      });
+      this.logger.warn(
+        {
+          currentSize: this.writeOffset,
+          chunkSize: audioBuffer.length,
+          maxSize: MAX_AUDIO_BUFFER_BYTES,
+        },
+        "Buffer limit exceeded, resetting"
+      );
       this.resetAudioBuffer();
       this.stateMachine.transitionTo(AgentState.IDLE);
       return;
@@ -274,12 +297,12 @@ export class ClientHandler {
 
     // Check minimum audio buffer size
     const totalSize = this.getBufferSize();
-    if (totalSize < 3200) {
-      this.logger.debug("Audio too short, ignoring", { bytes: totalSize });
+    if (totalSize < MIN_AUDIO_COMMIT_BYTES) {
+      this.logger.debug({ bytes: totalSize }, "Audio too short, ignoring");
       return;
     }
 
-    this.logger.info("Requesting AI response", { bytes: totalSize });
+    this.logger.info({ bytes: totalSize }, "Requesting AI response");
 
     // Transition to THINKING FIRST (before sending to OpenAI)
     this.stateMachine.transitionTo(AgentState.THINKING);

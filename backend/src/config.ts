@@ -27,20 +27,41 @@ if (!OPENAI_KEY_PATTERN.test(OPENAI_API_KEY)) {
   );
 }
 
-export const PORT = parseInt(process.env.PORT || "3000", 10);
+const PORT_RAW = parseInt(process.env.PORT || "3000", 10);
+
+// Validate PORT is a valid number (1-65535)
+if (isNaN(PORT_RAW) || PORT_RAW < 1 || PORT_RAW > 65535) {
+  throw new Error(
+    `Invalid PORT value: "${process.env.PORT || "3000"}". Must be a number between 1 and 65535.`
+  );
+}
+
+export const PORT = PORT_RAW;
 
 // WebSocket authentication
 // Set WS_AUTH_REQUIRED=false to disable authentication for local development
 export const WS_AUTH_REQUIRED = process.env.WS_AUTH_REQUIRED !== "false";
 export const WS_AUTH_TOKEN = process.env.WS_AUTH_TOKEN;
-export const WS_AUTH_SECRET = process.env.WS_AUTH_SECRET || "default-secret";
 
-// Warn if auth is required but no token is set
-if (WS_AUTH_REQUIRED && !WS_AUTH_TOKEN) {
-  logger.warn(
-    "WS_AUTH_REQUIRED is true but WS_AUTH_TOKEN is not set. " +
-    "Connections will be rejected."
-  );
+// Fallback secret for development only (NOT for production)
+// Warning: This is a weak fallback. Set WS_AUTH_TOKEN or WS_AUTH_SECRET explicitly for production.
+const WS_AUTH_SECRET_DEFAULT = "default-secret-change-me-in-production";
+export const WS_AUTH_SECRET = process.env.WS_AUTH_SECRET || WS_AUTH_SECRET_DEFAULT;
+
+// Warn about weak auth configuration
+if (WS_AUTH_REQUIRED) {
+  if (!WS_AUTH_TOKEN && WS_AUTH_SECRET === WS_AUTH_SECRET_DEFAULT) {
+    logger.warn(
+      "WS_AUTH_REQUIRED is true but using default fallback secret. " +
+      "For production, set WS_AUTH_TOKEN or WS_AUTH_SECRET explicitly."
+    );
+  }
+  if (!WS_AUTH_TOKEN) {
+    logger.warn(
+      "WS_AUTH_REQUIRED is true but WS_AUTH_TOKEN is not set. " +
+      "Connections may be rejected if WS_AUTH_SECRET is also unset."
+    );
+  }
 }
 
 // CORS configuration
@@ -63,6 +84,12 @@ export const MAX_AUDIO_BUFFER_BYTES = parseInt(
   process.env.MAX_AUDIO_BUFFER_BYTES || "10485760",
   10
 ); // 10MB max buffered audio per connection
+
+// Minimum audio commit size (200ms @ 16kHz PCM16 = 3200 bytes)
+export const MIN_AUDIO_COMMIT_BYTES = parseInt(
+  process.env.MIN_AUDIO_COMMIT_BYTES || "3200",
+  10
+);
 
 // VAD constants
 export const VAD_FRAME_SIZE_MS = 20; // 20ms frames
