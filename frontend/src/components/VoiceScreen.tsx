@@ -3,7 +3,7 @@
  * Flow: User speaks → AI processes → AI responds COMPLETELY → User can speak again
  */
 
-import React, { useState, useCallback, useRef } from "react";
+import React, { useState, useCallback, useRef, useMemo } from "react";
 import {
   View,
   Text,
@@ -13,6 +13,9 @@ import {
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useAudioRecording } from "../hooks/useAudioRecording";
 import { AudioPlayer, AudioPlayerHandle } from "./AudioPlayer";
+import { createLogger } from "../utils/logger";
+
+const logger = createLogger("VoiceScreen");
 
 type ConversationState = "idle" | "listening" | "processing" | "playing";
 
@@ -21,6 +24,7 @@ export function VoiceScreen() {
   const [isStreamComplete, setIsStreamComplete] = useState(false);
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [conversationState, setConversationState] = useState<ConversationState>("idle");
+  const [showError, setShowError] = useState(false);
   const audioPlayerRef = useRef<AudioPlayerHandle>(null);
 
   // Handle audio received from backend
@@ -32,13 +36,28 @@ export function VoiceScreen() {
 
   // Handle audio stream complete - all audio received from AI
   const handleAudioDone = useCallback(() => {
-    console.log("[VoiceScreen] All audio received from AI - ready to play");
+    logger.info("All audio received from AI - ready to play");
     setIsStreamComplete(true);
     setConversationState("playing");
   }, []);
 
   // WebSocket connection
-  const { connectionState, sendAudio } = useWebSocket(handleAudioReceived, handleAudioDone);
+  const { connectionState, sendAudio, error, reconnect } = useWebSocket(handleAudioReceived, handleAudioDone);
+
+  // Show error when error state is set
+  React.useEffect(() => {
+    if (connectionState === "error" && error) {
+      setShowError(true);
+    } else {
+      setShowError(false);
+    }
+  }, [connectionState, error]);
+
+  // Dismiss error when reconnecting
+  const handleDismissError = useCallback(() => {
+    setShowError(false);
+    reconnect();
+  }, [reconnect]);
 
   // Audio recording - only send when we're in listening state
   const { isRecording, startRecording, stopRecording, requestPermissions } = useAudioRecording(
@@ -56,18 +75,18 @@ export function VoiceScreen() {
   // Handle start button press
   const handleStartPress = async () => {
     if (connectionState !== "connected") {
-      console.warn("[VoiceScreen] Not connected");
+      logger.warn("Not connected");
       return;
     }
 
     try {
       const granted = await requestPermissions();
       if (!granted) {
-        console.warn("[VoiceScreen] Permissions not granted");
+        logger.warn("Permissions not granted");
         return;
       }
 
-      console.log("[VoiceScreen] Starting session...");
+      logger.info("Starting session...");
       setIsSessionActive(true);
       setConversationState("idle");
       setAudioChunk(null);
@@ -75,7 +94,7 @@ export function VoiceScreen() {
       audioPlayerRef.current?.clearQueue();
       await startRecording();
     } catch (error) {
-      console.error("[VoiceScreen] Error starting:", error);
+      logger.error("Error starting:", error);
       setIsSessionActive(false);
     }
   };
@@ -83,18 +102,18 @@ export function VoiceScreen() {
   // Handle stop button press
   const handleStopPress = async () => {
     try {
-      console.log("[VoiceScreen] Stopping session...");
+      logger.info("Stopping session...");
       setIsSessionActive(false);
       setConversationState("idle");
       await stopRecording();
     } catch (error) {
-      console.error("[VoiceScreen] Error stopping:", error);
+      logger.error("Error stopping:", error);
     }
   };
 
   // Handle playback complete - user can speak again
   const handlePlaybackComplete = useCallback(() => {
-    console.log("[VoiceScreen] Playback complete - user can speak now");
+    logger.info("Playback complete - user can speak now");
     setAudioChunk(null);
     setIsStreamComplete(false);
     setConversationState("idle");
@@ -103,34 +122,13 @@ export function VoiceScreen() {
   // Handle playback status change
   const handlePlaybackStatusChange = useCallback((isPlaying: boolean) => {
     if (isPlaying) {
-      console.log("[VoiceScreen] AI is speaking...");
+      logger.info("AI is speaking...");
       setConversationState("playing");
     }
   }, []);
 
-  // Get status text based on conversation state
-  const getStatusText = (): string => {
-    if (!isSessionActive) {
-      switch (connectionState) {
-        case "connecting": return "Connecting...";
-        case "connected": return "Ready - Press START";
-        case "disconnected": return "Disconnected";
-        case "error": return "Connection Error";
-        default: return "Unknown";
-      }
-    }
-
-    switch (conversationState) {
-      case "idle": return "🎤 Speak now...";
-      case "listening": return "🎤 Listening...";
-      case "processing": return "⏳ AI is thinking...";
-      case "playing": return "🔊 AI is speaking...";
-      default: return "Ready";
-    }
-  };
-
-  // Get status color
-  const getStatusColor = (): string => {
+  // Memoized status calculation to avoid redundant computation
+  const statusColor = useMemo((): string => {
     if (!isSessionActive) {
       switch (connectionState) {
         case "connecting": return "#FFA500";
@@ -148,9 +146,28 @@ export function VoiceScreen() {
       case "playing": return "#0066FF"; // Blue - AI speaking
       default: return "#000000";
     }
-  };
+  }, [connectionState, conversationState, isSessionActive]);
 
-  // Can user speak right now?
+  const statusText = useMemo((): string => {
+    if (!isSessionActive) {
+      switch (connectionState) {
+        case "connecting": return "Connecting...";
+        case "connected": return "Ready - Press START";
+        case "disconnected": return "Disconnected";
+        case "error": return "Connection Error";
+        default: return "Unknown";
+      }
+    }
+
+    switch (conversationState) {
+      case "idle": return "🎤 Speak now...";
+      case "listening": return "🎤 Listening...";
+      case "processing": return "⏳ AI is thinking...";
+      case "playing": return "🔊 AI is speaking...";
+      default: return "Ready";
+    }
+  }, [connectionState, conversationState, isSessionActive]);
+
   const canUserSpeak = isSessionActive && (conversationState === "idle" || conversationState === "listening");
 
   return (
@@ -162,9 +179,9 @@ export function VoiceScreen() {
 
       {/* Status */}
       <View style={styles.statusContainer}>
-        <View style={[styles.statusIndicator, { backgroundColor: getStatusColor() }]} />
-        <Text style={[styles.statusText, { color: getStatusColor() }]}>
-          {getStatusText()}
+        <View style={[styles.statusIndicator, { backgroundColor: statusColor }]} />
+        <Text style={[styles.statusText, { color: statusColor }]}>
+          {statusText}
         </Text>
       </View>
 
@@ -180,6 +197,21 @@ export function VoiceScreen() {
           <Text style={styles.hintText}>Speak clearly, I'm listening!</Text>
         )}
       </View>
+
+      {/* Error display */}
+      {showError && error && (
+        <View style={styles.errorContainer}>
+          <Text style={styles.errorTitle}>Connection Error</Text>
+          <Text style={styles.errorMessage}>{error.message}</Text>
+          <TouchableOpacity
+            style={styles.retryButton}
+            onPress={handleDismissError}
+            activeOpacity={0.7}
+          >
+            <Text style={styles.retryButtonText}>Retry</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       {/* Buttons */}
       <View style={styles.buttonContainer}>
@@ -311,5 +343,38 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: "#999999",
     textAlign: "center",
+  },
+  errorContainer: {
+    padding: 20,
+    backgroundColor: "#FFF0F0",
+    borderRadius: 12,
+    marginHorizontal: 20,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: "#FFCCCC",
+  },
+  errorTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#CC0000",
+    marginBottom: 8,
+  },
+  errorMessage: {
+    fontSize: 15,
+    color: "#660000",
+    marginBottom: 12,
+    lineHeight: 21,
+  },
+  retryButton: {
+    alignSelf: "flex-start",
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    backgroundColor: "#CC0000",
+    borderRadius: 20,
+  },
+  retryButtonText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#FFFFFF",
   },
 });

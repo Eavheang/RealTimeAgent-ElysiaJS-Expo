@@ -4,6 +4,7 @@
  */
 
 import WebSocket from "ws";
+import { logger } from "../logger";
 import {
   OPENAI_API_KEY,
   OPENAI_REALTIME_URL,
@@ -112,6 +113,9 @@ export class OpenAIRealtimeConnection {
   // Connection timeout
   private connectionTimeoutMs = 15000; // 15 seconds to establish connection
 
+  // Logger child for this connection
+  private log = logger.child({ component: "OpenAIRealtimeConnection" }, { msgPrefix: "[OpenAI] " });
+
   constructor(
     callbacks: OpenAIRealtimeCallbacks,
     circuitBreakerConfig: Partial<CircuitBreakerConfig> = {},
@@ -128,34 +132,34 @@ export class OpenAIRealtimeConnection {
   connect(): void {
     // Check circuit breaker state
     if (!this.canAttemptConnection()) {
-      console.warn("[OpenAI] Cannot connect: circuit breaker is open");
+      this.log.warn("Cannot connect: circuit breaker is open");
       return;
     }
 
     // Prevent multiple simultaneous connections
     if (this.ws?.readyState === WebSocket.OPEN) {
-      console.warn("[OpenAI] Already connected to OpenAI, skipping");
+      this.log.warn("Already connected, skipping");
       return;
     }
 
     if (this.ws?.readyState === WebSocket.CONNECTING) {
-      console.warn("[OpenAI] Already connecting to OpenAI, skipping");
+      this.log.warn("Already connecting, skipping");
       return;
     }
 
     // Close existing connection if any
     if (this.ws) {
-      console.warn("[OpenAI] Closing existing connection before reconnecting");
+      this.log.warn("Closing existing connection before reconnecting");
       this.disconnect();
     }
 
     this.shouldReconnect = true;
 
-    console.log("[OpenAI] Connecting to OpenAI Realtime API...");
+    this.log.info("Connecting to Realtime API...");
 
     // Set connection timeout
     this.connectTimeout = setTimeout(() => {
-      console.error("[OpenAI] Connection timeout");
+      this.log.error("Connection timeout");
       this.handleConnectionError(new Error("Connection timeout"));
     }, this.connectionTimeoutMs);
 
@@ -176,7 +180,7 @@ export class OpenAIRealtimeConnection {
         this.connectTimeout = null;
       }
 
-      console.log("[OpenAI] Connected to OpenAI Realtime API");
+      this.log.info("Connected to Realtime API");
       this.isConnected = true;
       this.resetCircuitBreaker();
       this.reconnectAttempts = 0;
@@ -190,12 +194,12 @@ export class OpenAIRealtimeConnection {
         const message = JSON.parse(data.toString()) as OpenAIRealtimeMessage;
         this.handleMessage(message);
       } catch (error) {
-        console.error("[OpenAI] Error parsing message:", error);
+        this.log.error("Error parsing message", { error });
       }
     });
 
     this.ws.on("error", (error: Error) => {
-      console.error("[OpenAI] WebSocket error:", error);
+      this.log.error("WebSocket error", { error });
       this.handleConnectionError(error);
       this.callbacks.onError?.(error);
     });
@@ -207,7 +211,7 @@ export class OpenAIRealtimeConnection {
         this.connectTimeout = null;
       }
 
-      console.log("[OpenAI] Disconnected from OpenAI Realtime API");
+      this.log.info("Disconnected from Realtime API");
       this.isConnected = false;
 
       // Handle unexpected disconnection (not due to disconnect() call)
@@ -246,7 +250,7 @@ export class OpenAIRealtimeConnection {
     };
 
     this.sendMessage(sessionUpdate);
-    console.log("[OpenAI] Session initialized with system prompt");
+    this.log.info("Session initialized with system prompt");
   }
 
   /**
@@ -266,43 +270,43 @@ export class OpenAIRealtimeConnection {
 
       case "response.completed":
         // Response completed - but we use response.done as the main trigger
-        console.log("[OpenAI] Response completed (waiting for response.done)");
+        this.log.debug("Response completed (waiting for response.done)");
         break;
 
       case "input_audio_buffer.speech_started":
-        console.log("[OpenAI] ✅ Speech started event received");
+        this.log.info("Speech started event received");
         this.callbacks.onSpeechStarted?.();
         break;
 
       case "input_audio_buffer.speech_stopped":
-        console.log("[OpenAI] ✅ Speech stopped event received");
+        this.log.info("Speech stopped event received");
         this.callbacks.onSpeechStopped?.();
         break;
 
       case "error":
         // Ignore empty buffer commit errors (benign)
         if (message.error.code === "input_audio_buffer_commit_empty") {
-          console.warn("[OpenAI] Warning:", message.error.message);
+          this.log.warn("Empty buffer commit error", { message: message.error.message });
           return;
         }
 
         if (message.error.code === "conversation_already_has_active_response") {
-          console.warn("[OpenAI] Warning:", message.error.message);
+          this.log.warn("Already has active response", { message: message.error.message });
           return;
         }
 
-        console.error("[OpenAI] API error:", message.error);
+        this.log.error("API error", { error: message.error });
         this.callbacks.onError?.(new Error(`${message.error.code}: ${message.error.message}`));
         break;
 
       case "response.done":
-        console.log("[OpenAI] Response done - triggering completion");
+        this.log.info("Response done - triggering completion");
         this.callbacks.onResponseCompleted?.();
         break;
 
       default:
         // Log unhandled message types for debugging
-        console.log(`[OpenAI] Received message type: ${messageType}`);
+        this.log.debug("Received message type", { type: messageType });
         break;
     }
   }
@@ -337,7 +341,7 @@ export class OpenAIRealtimeConnection {
       type: "input_audio_buffer.commit",
     };
     this.sendMessage(message);
-    console.log("[OpenAI] Audio buffer committed");
+    this.log.debug("Audio buffer committed");
   }
 
   /**
@@ -351,7 +355,7 @@ export class OpenAIRealtimeConnection {
       },
     };
     this.sendMessage(message);
-    console.log("[OpenAI] Response creation requested");
+    this.log.debug("Response creation requested");
   }
 
   /**
@@ -362,7 +366,7 @@ export class OpenAIRealtimeConnection {
       type: "response.cancel",
     };
     this.sendMessage(message);
-    console.log("[OpenAI] Response cancelled");
+    this.log.debug("Response cancelled");
   }
 
   /**
@@ -373,7 +377,7 @@ export class OpenAIRealtimeConnection {
       type: "input_audio_buffer.clear",
     };
     this.sendMessage(message);
-    console.log("[OpenAI] Input audio buffer cleared");
+    this.log.debug("Input audio buffer cleared");
   }
 
   /**
@@ -416,7 +420,7 @@ export class OpenAIRealtimeConnection {
     this.failureCount++;
     this.lastFailureTime = Date.now();
 
-    console.error("[OpenAI] Connection error:", {
+    this.log.error("Connection error", {
       message: error.message,
       attempt: this.reconnectAttempts,
       failureCount: this.failureCount,
@@ -432,7 +436,7 @@ export class OpenAIRealtimeConnection {
     if (this.shouldReconnect && this.reconnectAttempts < this.reconnectionConfig.maxAttempts) {
       this.scheduleReconnection();
     } else if (this.reconnectAttempts >= this.reconnectionConfig.maxAttempts) {
-      console.error("[OpenAI] Max reconnection attempts reached. Giving up.");
+      this.log.error("Max reconnection attempts reached. Giving up.");
       this.callbacksWithErrorInfo(new Error("Max reconnection attempts reached. Giving up."));
     }
   }
@@ -449,8 +453,8 @@ export class OpenAIRealtimeConnection {
     if (!this.canAttemptConnection()) {
       const cooldownEnd = this.lastFailureTime + this.circuitBreakerConfig.resetTimeoutMs;
       const cooldownRemaining = Math.max(0, cooldownEnd - Date.now());
-      console.log(
-        `[OpenAI] Circuit breaker is open. Scheduling reconnection in ${cooldownRemaining}ms`
+      this.log.info(
+        `Circuit breaker is open. Scheduling reconnection in ${cooldownRemaining}ms`
       );
       this.reconnectTimeout = setTimeout(() => {
         this.circuitBreakerState = CircuitBreakerState.HALF_OPEN;
@@ -470,8 +474,8 @@ export class OpenAIRealtimeConnection {
     this.isReconnecting = true;
     this.reconnectAttempts++;
 
-    console.log(
-      `[OpenAI] Scheduling reconnection attempt ${this.reconnectAttempts}/${this.reconnectionConfig.maxAttempts} in ${Math.round(delay)}ms`
+    this.log.info(
+      `Scheduling reconnection attempt ${this.reconnectAttempts}/${this.reconnectionConfig.maxAttempts} in ${Math.round(delay)}ms`
     );
 
     this.reconnectTimeout = setTimeout(() => {
@@ -484,7 +488,7 @@ export class OpenAIRealtimeConnection {
    */
   private attemptReconnection(): void {
     if (this.shouldReconnect) {
-      console.log(`[OpenAI] Reconnection attempt ${this.reconnectAttempts}`);
+      this.log.info(`Reconnection attempt ${this.reconnectAttempts}`);
       this.connect();
     }
   }
@@ -495,8 +499,8 @@ export class OpenAIRealtimeConnection {
   private openCircuitBreaker(): void {
     this.circuitBreakerState = CircuitBreakerState.OPEN;
     this.lastFailureTime = Date.now();
-    console.warn(
-      `[OpenAI] Circuit breaker opened after ${this.failureCount} failures. Next attempt after ${this.circuitBreakerConfig.resetTimeoutMs}ms`
+    this.log.warn(
+      `Circuit breaker opened after ${this.failureCount} failures. Next attempt after ${this.circuitBreakerConfig.resetTimeoutMs}ms`
     );
   }
 
@@ -505,7 +509,7 @@ export class OpenAIRealtimeConnection {
    */
   private resetCircuitBreaker(): void {
     if (this.circuitBreakerState !== CircuitBreakerState.CLOSED) {
-      console.log("[OpenAI] Circuit breaker reset to CLOSED");
+      this.log.info("Circuit breaker reset to CLOSED");
     }
     this.circuitBreakerState = CircuitBreakerState.CLOSED;
     this.failureCount = 0;

@@ -3,6 +3,7 @@
  * Simple turn-based conversation: User speaks → AI responds completely → User speaks again
  */
 
+import type { Logger } from "pino";
 import { VAD } from "../audio/vad";
 import { AgentStateMachine, AgentState } from "../agent/state";
 import { OpenAIRealtimeConnection } from "./openai";
@@ -10,18 +11,31 @@ import { MAX_AUDIO_BUFFER_BYTES } from "../config";
 
 /**
  * Per-connection client handler
+ * Optimized with single pre-allocated buffer for audio accumulation
  */
 export class ClientHandler {
   private vad: VAD;
   private stateMachine: AgentStateMachine;
   private openai: OpenAIRealtimeConnection | null = null;
-  private audioBuffer: Buffer[] = [];
-  private totalBufferSize = 0; // Track total buffer size in bytes
-  private sendToClient: (data: string) => void;
+  private audioBuffer: Buffer | null = null;
+  private writeOffset = 0; // Write pointer for the buffer
+  private sendToClient: (data: string) => boolean;
   private isOpenAIConnected = false;
+  private logger: Logger;
+  private isClosing = false; // Flag to prevent sends during close
 
-  constructor(sendToClient: (data: string) => void) {
+  // VAD debouncing state
+  private speechStartedTime: number | null = null;
+  private speechEndedTime: number | null = null;
+  private readonly SPEAKING_CONFIRMATION_MS = 200; // Require 200ms of speech to confirm
+  private readonly SPEECH_COOLDOWN_MS = 300; // Wait 300ms after speech ends before accepting new speech
+
+  constructor(
+    sendToClient: (data: string) => boolean,
+    logger: Logger
+  ) {
     this.sendToClient = sendToClient;
+    this.logger = logger;
     this.vad = new VAD();
     this.stateMachine = new AgentStateMachine();
   }
@@ -30,25 +44,68 @@ export class ClientHandler {
    * Check if adding a chunk would exceed the buffer size limit
    */
   private wouldExceedBufferLimit(chunkSize: number): boolean {
-    return this.totalBufferSize + chunkSize > MAX_AUDIO_BUFFER_BYTES;
+    return this.writeOffset + chunkSize > MAX_AUDIO_BUFFER_BYTES;
   }
 
   /**
    * Reset audio buffer and size tracking
+   * Reallocates buffer for fresh start
    */
   private resetAudioBuffer(): void {
-    this.audioBuffer = [];
-    this.totalBufferSize = 0;
+    this.audioBuffer = null;
+    this.writeOffset = 0;
+  }
+
+  /**
+   * Get current buffer size
+   */
+  private getBufferSize(): number {
+    return this.writeOffset;
+  }
+
+  /**
+   * Reset VAD debouncing state
+   */
+  private resetVADDebouncingState(): void {
+    this.speechStartedTime = null;
+    this.speechEndedTime = null;
+  }
+
+  /**
+   * Mark handler as closing to prevent further sends
+   */
+  markAsClosing(): void {
+    this.isClosing = true;
+  }
+
+  /**
+   * Safe send wrapper with closing check
+   */
+  private safeSend(data: string): boolean {
+    if (this.isClosing) {
+      return false;
+    }
+    return this.sendToClient(data);
   }
 
   /**
    * Lazy initialization of OpenAI connection
+   * Reconnects if existing connection is disconnected
    */
   private ensureOpenAIConnected(): void {
-    if (this.openai && this.isOpenAIConnected) return;
-    if (this.openai) return;
+    // Check if already connected using actual connection state
+    if (this.openai && this.openai.getIsConnected()) {
+      return;
+    }
 
-    console.log("[ClientHandler] Initializing OpenAI connection...");
+    // If connection exists but is disconnected, trigger reconnect
+    if (this.openai) {
+      this.logger.info("OpenAI connection exists but disconnected, reconnecting...");
+      this.openai.connect();
+      return;
+    }
+
+    this.logger.info("Initializing OpenAI connection...");
 
     this.openai = new OpenAIRealtimeConnection({
       onAudioDelta: (audioBase64: string) => {
@@ -58,41 +115,77 @@ export class ClientHandler {
         this.handleResponseCompleted();
       },
       onError: (error: Error) => {
-        console.error("[ClientHandler] OpenAI error:", error);
+        this.logger.error("OpenAI error", { error });
         this.stateMachine.reset();
         this.resetAudioBuffer();
       },
       onConnected: () => {
-        console.log("[ClientHandler] OpenAI connected");
+        this.logger.info("OpenAI connected");
         this.isOpenAIConnected = true;
         this.flushAudioBuffer();
       },
       onDisconnected: () => {
-        console.log("[ClientHandler] OpenAI disconnected");
+        this.logger.info("OpenAI disconnected");
         this.isOpenAIConnected = false;
       },
       // Speech detection - ONLY process when we're in IDLE or LISTENING state
       onSpeechStarted: () => {
         const state = this.stateMachine.getState();
+        const now = Date.now();
+
+        // VAD deouncing: Check cooldown period
+        if (this.speechEndedTime && (now - this.speechEndedTime < this.SPEECH_COOLDOWN_MS)) {
+          this.logger.debug("Ignoring speech_started (cooldown)", {
+            timeSinceEnd: now - this.speechEndedTime,
+            cooldown: this.SPEECH_COOLDOWN_MS,
+          });
+          return;
+        }
+
         // Only react to speech if we're ready to listen
         if (state === AgentState.IDLE) {
-          console.log("[ClientHandler] ✅ User started speaking");
-          this.stateMachine.transitionTo(AgentState.LISTENING);
+          // Track speech start for confirmation debouncing
+          this.speechStartedTime = now;
+
+          // Confirmation debouncing: require speech to last > SPEAKING_CONFIRMATION_MS
+          // We'll transition to LISTENING on confirmation
+          setTimeout(() => {
+            if (this.speechStartedTime === now && this.stateMachine.is(AgentState.IDLE)) {
+              // Still in speech started state, confirm speech is real
+              this.logger.info("Speech confirmed, transitioning to LISTENING");
+              this.stateMachine.transitionTo(AgentState.LISTENING);
+            }
+          }, this.SPEAKING_CONFIRMATION_MS);
+
         } else if (state === AgentState.LISTENING) {
           // Already listening, continue
+          this.speechStartedTime = null; // No longer debouncing
         } else {
           // THINKING or SPEAKING - ignore speech events
-          console.log(`[ClientHandler] Ignoring speech_started (state: ${state})`);
+          this.logger.debug("Ignoring speech_started", { state });
         }
       },
       onSpeechStopped: () => {
         const state = this.stateMachine.getState();
+        const now = Date.now();
+
         // Only trigger response if we're in LISTENING state
         if (state === AgentState.LISTENING) {
-          console.log("[ClientHandler] ✅ User stopped speaking - requesting AI response");
+          // Speech ended - set cooldown timestamp
+          this.speechEndedTime = now;
+          this.speechStartedTime = null;
+
+          this.logger.info("User stopped speaking - requesting AI response");
           this.triggerResponse();
+        } else if (state === AgentState.IDLE && this.speechStartedTime) {
+          // Speech started but never confirmed - this was a false positive (noise pop)
+          this.logger.debug("Rejected brief speech (false positive)", {
+            duration: now - this.speechStartedTime,
+          });
+          this.resetAudioBuffer();
+          this.speechStartedTime = null;
         } else {
-          console.log(`[ClientHandler] Ignoring speech_stopped (state: ${state})`);
+          this.logger.debug("Ignoring speech_stopped", { state });
         }
       },
     });
@@ -104,12 +197,16 @@ export class ClientHandler {
    * Send buffered audio to OpenAI after connection
    */
   private flushAudioBuffer(): void {
-    if (!this.openai || !this.isOpenAIConnected || this.audioBuffer.length === 0) return;
+    if (!this.openai || !this.openai.getIsConnected() || !this.audioBuffer) return;
 
-    console.log(`[ClientHandler] Flushing ${this.audioBuffer.length} buffered audio chunks`);
-    for (const chunk of this.audioBuffer) {
-      this.openai.appendAudio(chunk.toString("base64"));
-    }
+    const bufferSize = this.writeOffset;
+    if (bufferSize === 0) return;
+
+    this.logger.info("Flushing buffered audio", { bytes: bufferSize });
+
+    // Slice the buffer to get actual data and send to OpenAI
+    const actualData = this.audioBuffer.subarray(0, bufferSize);
+    this.openai.appendAudio(actualData.toString("base64"));
   }
 
   /**
@@ -137,9 +234,11 @@ export class ClientHandler {
   private processAudio(audioBuffer: Buffer): void {
     // Check buffer size limit
     if (this.wouldExceedBufferLimit(audioBuffer.length)) {
-      console.warn(
-        `[ClientHandler] Buffer limit exceeded (${this.totalBufferSize} + ${audioBuffer.length} > ${MAX_AUDIO_BUFFER_BYTES}), resetting`
-      );
+      this.logger.warn("Buffer limit exceeded, resetting", {
+        currentSize: this.writeOffset,
+        chunkSize: audioBuffer.length,
+        maxSize: MAX_AUDIO_BUFFER_BYTES,
+      });
       this.resetAudioBuffer();
       this.stateMachine.transitionTo(AgentState.IDLE);
       return;
@@ -151,9 +250,14 @@ export class ClientHandler {
       this.resetAudioBuffer();
     }
 
-    // Buffer the audio and track size
-    this.audioBuffer.push(audioBuffer);
-    this.totalBufferSize += audioBuffer.length;
+    // Initialize buffer on first chunk
+    if (!this.audioBuffer) {
+      this.audioBuffer = Buffer.alloc(MAX_AUDIO_BUFFER_BYTES);
+    }
+
+    // Copy chunk directly into buffer at write offset
+    this.audioBuffer.set(audioBuffer, this.writeOffset);
+    this.writeOffset += audioBuffer.length;
 
     // Send to OpenAI for VAD processing
     if (this.openai && this.isOpenAIConnected) {
@@ -169,13 +273,13 @@ export class ClientHandler {
     if (!this.openai || !this.isOpenAIConnected) return;
 
     // Check minimum audio buffer size
-    const totalSize = this.totalBufferSize;
+    const totalSize = this.getBufferSize();
     if (totalSize < 3200) {
-      console.log(`[ClientHandler] Audio too short (${totalSize} bytes), ignoring`);
+      this.logger.debug("Audio too short, ignoring", { bytes: totalSize });
       return;
     }
 
-    console.log(`[ClientHandler] Requesting AI response (${totalSize} bytes of audio)`);
+    this.logger.info("Requesting AI response", { bytes: totalSize });
 
     // Transition to THINKING FIRST (before sending to OpenAI)
     this.stateMachine.transitionTo(AgentState.THINKING);
@@ -189,14 +293,17 @@ export class ClientHandler {
    * Handle audio from OpenAI (AI speaking)
    */
   private handleOpenAIAudio(audioBase64: string): void {
+    // Don't send if closing
+    if (this.isClosing) return;
+
     // Transition to SPEAKING when first audio arrives
     if (this.stateMachine.is(AgentState.THINKING)) {
       this.stateMachine.transitionTo(AgentState.SPEAKING);
-      console.log("[ClientHandler] AI started speaking");
+      this.logger.info("AI started speaking");
     }
 
     // Forward audio to client
-    this.sendToClient(JSON.stringify({
+    this.safeSend(JSON.stringify({
       type: "audio",
       data: audioBase64,
     }));
@@ -206,26 +313,30 @@ export class ClientHandler {
    * Handle AI response completed - ALL audio has been sent
    */
   private handleResponseCompleted(): void {
-    console.log("[ClientHandler] AI response stream completed");
+    this.logger.info("AI response stream completed");
+
+    // Don't send if closing
+    if (this.isClosing) return;
 
     const state = this.stateMachine.getState();
-    
+
     if (state === AgentState.SPEAKING || state === AgentState.THINKING) {
       // Send "audio_done" to tell client all audio has been sent
       // Client should wait for playback to finish before allowing user to speak
-      this.sendToClient(JSON.stringify({ type: "audio_done" }));
-      
+      this.safeSend(JSON.stringify({ type: "audio_done" }));
+
       // Transition to IDLE
       this.stateMachine.transitionTo(AgentState.IDLE);
       this.resetAudioBuffer();
       this.vad.reset();
+      this.resetVADDebouncingState();
 
       // Clear OpenAI's input buffer for fresh start
       if (this.openai && this.isOpenAIConnected) {
         this.openai.clearInputBuffer();
       }
 
-      console.log("[ClientHandler] Waiting for client to finish playback");
+      this.logger.info("Waiting for client to finish playback");
     }
   }
 
@@ -233,7 +344,7 @@ export class ClientHandler {
    * Clean up resources
    */
   cleanup(): void {
-    console.log("[ClientHandler] Cleaning up");
+    this.logger.info("Cleaning up");
     if (this.openai) {
       this.openai.disconnect();
       this.openai = null;
@@ -241,6 +352,7 @@ export class ClientHandler {
     this.isOpenAIConnected = false;
     this.vad.reset();
     this.resetAudioBuffer();
+    this.resetVADDebouncingState();
   }
 
   getState(): AgentState {

@@ -6,6 +6,9 @@
 import { useCallback, useRef, useState, useEffect } from "react";
 import LiveAudioStream from "react-native-live-audio-stream";
 import { PermissionsAndroid, Platform } from "react-native";
+import { createLogger } from "../utils/logger";
+
+const logger = createLogger("AudioRecording");
 
 interface UseAudioRecordingReturn {
   isRecording: boolean;
@@ -45,7 +48,7 @@ export function useAudioRecording(
     if (!isInitializedRef.current) {
       LiveAudioStream.init(AUDIO_CONFIG);
       isInitializedRef.current = true;
-      console.log("[AudioRecording] LiveAudioStream initialized with config:", AUDIO_CONFIG);
+      logger.info("LiveAudioStream initialized with config:", AUDIO_CONFIG);
     }
 
     // Set up audio data listener
@@ -61,7 +64,7 @@ export function useAudioRecording(
         // Send to WebSocket
         onAudioChunkRef.current(bytes.buffer);
       } catch (error) {
-        console.error("[AudioRecording] Error processing audio chunk:", error);
+        logger.error("Error processing audio chunk:", error);
       }
     }) as any;
 
@@ -87,13 +90,13 @@ export function useAudioRecording(
           }
         );
         if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-          console.error("[AudioRecording] Permission denied");
+          logger.error("Permission denied");
           return false;
         }
       }
       return true;
     } catch (error) {
-      console.error("[AudioRecording] Error requesting permissions:", error);
+      logger.error("Error requesting permissions:", error);
       return false;
     }
   }, []);
@@ -105,12 +108,12 @@ export function useAudioRecording(
         throw new Error("Microphone permission not granted");
       }
 
-      console.log("[AudioRecording] Starting PCM recording...");
+      logger.info("Starting PCM recording...");
       LiveAudioStream.start();
       setIsRecording(true);
-      console.log("[AudioRecording] Recording started with real-time PCM streaming");
+      logger.info("Recording started with real-time PCM streaming");
     } catch (error) {
-      console.error("[AudioRecording] Error starting recording:", error);
+      logger.error("Error starting recording:", error);
       setIsRecording(false);
       throw error;
     }
@@ -118,14 +121,14 @@ export function useAudioRecording(
 
   const stopRecording = useCallback(async () => {
     try {
-      console.log("[AudioRecording] Stopping recording...");
+      logger.info("Stopping recording...");
       LiveAudioStream.stop();
       setIsRecording(false);
 
       // Notify that recording stopped
       onSilenceDetected?.();
     } catch (error) {
-      console.error("[AudioRecording] Error stopping recording:", error);
+      logger.error("Error stopping recording:", error);
       setIsRecording(false);
     }
   }, [onSilenceDetected]);

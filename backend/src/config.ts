@@ -2,6 +2,8 @@
  * Configuration and constants for the voice agent backend
  */
 
+import { logger } from "./logger";
+
 // OpenAI API key validation pattern
 // Supports:
 // - Standard keys: sk-xxxxxxxxxxxxxxxxxxxxxxxx
@@ -35,9 +37,9 @@ export const WS_AUTH_SECRET = process.env.WS_AUTH_SECRET || "default-secret";
 
 // Warn if auth is required but no token is set
 if (WS_AUTH_REQUIRED && !WS_AUTH_TOKEN) {
-  console.warn(
-    "WARNING: WS_AUTH_REQUIRED is true but WS_AUTH_TOKEN is not set. " +
-    "Connections will be rejected. Set WS_AUTH_TOKEN in your environment."
+  logger.warn(
+    "WS_AUTH_REQUIRED is true but WS_AUTH_TOKEN is not set. " +
+    "Connections will be rejected."
   );
 }
 

@@ -6,11 +6,17 @@
 import { useEffect, useRef, useCallback, useImperativeHandle, forwardRef } from "react";
 import { Audio } from "expo-av";
 import { base64ToArrayBuffer } from "../utils/audioUtils";
+import { createLogger } from "../utils/logger";
+
+const logger = createLogger("AudioPlayer");
 
 // Configuration
 const SAMPLE_RATE = 24000; // OpenAI uses 24kHz for output audio
 const BYTES_PER_SAMPLE = 2; // 16-bit = 2 bytes
 const CHANNELS = 1;
+const MAX_STREAM_DURATION_MS = 60000; // Max 60 seconds of audio
+const MAX_BUFFER_SIZE = SAMPLE_RATE * BYTES_PER_SAMPLE * (MAX_STREAM_DURATION_MS / 1000); // ~2.88MB
+const BYTES_PER_MS = SAMPLE_RATE * BYTES_PER_SAMPLE / 1000; // Bytes per millisecond = 48
 
 interface AudioPlayerProps {
   audioBase64: string | null;
@@ -25,45 +31,46 @@ export interface AudioPlayerHandle {
 
 /**
  * Audio player that waits for ALL audio chunks, then plays as one continuous sound
+ * Optimized with single pre-allocated buffer to reduce memory overhead
  */
 export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
   ({ audioBase64, isStreamComplete, onPlaybackComplete, onPlaybackStatusChange }, ref) => {
-    // Accumulated PCM data
-    const audioBufferRef = useRef<Uint8Array[]>([]);
-    const totalBytesRef = useRef(0);
-    
+    // Single pre-allocated buffer with write pointer tracking
+    const audioBufferRef = useRef<Uint8Array | null>(null);
+    const writeOffsetRef = useRef(0);
+
     // Playback state
     const soundRef = useRef<Audio.Sound | null>(null);
     const isPlayingRef = useRef(false);
     const hasPlayedRef = useRef(false); // Prevent playing twice
-    
+
     // Lifecycle
     const isMountedRef = useRef(true);
     const isAudioModeSetRef = useRef(false);
 
     // Reset state
     const resetState = useCallback(() => {
-      audioBufferRef.current = [];
-      totalBytesRef.current = 0;
+      audioBufferRef.current = null;
+      writeOffsetRef.current = 0;
       hasPlayedRef.current = false;
     }, []);
 
     // Expose clearQueue method
     useImperativeHandle(ref, () => ({
       clearQueue: () => {
-        console.log("[AudioPlayer] Clearing audio queue");
-        
+        logger.info("Clearing audio queue");
+
         if (soundRef.current) {
-          soundRef.current.stopAsync().catch(() => {});
-          soundRef.current.unloadAsync().catch(() => {});
+          soundRef.current.stopAsync().catch((e) => logger.debug("Error stopping async on clear", e));
+          soundRef.current.unloadAsync().catch((e) => logger.debug("Error unloading async on clear", e));
           soundRef.current = null;
         }
-        
+
         if (isPlayingRef.current) {
           isPlayingRef.current = false;
           onPlaybackStatusChange?.(false);
         }
-        
+
         resetState();
       },
     }), [resetState, onPlaybackStatusChange]);
@@ -81,38 +88,34 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
               playThroughEarpieceAndroid: false,
             });
             isAudioModeSetRef.current = true;
-            console.log("[AudioPlayer] Audio mode configured");
+            logger.debug("Audio mode configured");
           } catch (error) {
-            console.error("[AudioPlayer] Error setting audio mode:", error);
+            logger.error("Error setting audio mode:", error);
           }
         }
       };
-      
+
       setupAudioMode();
       isMountedRef.current = true;
-      
+
       return () => {
         isMountedRef.current = false;
         if (soundRef.current) {
-          soundRef.current.unloadAsync().catch(() => {});
+          soundRef.current.unloadAsync().catch((e) => logger.debug("Error unloading async on unmount", e));
         }
       };
-    }, []);
-
-    // Combine all buffered audio into single Uint8Array
-    const combineBuffers = useCallback((): Uint8Array => {
-      const combined = new Uint8Array(totalBytesRef.current);
-      let offset = 0;
-      for (const chunk of audioBufferRef.current) {
-        combined.set(chunk, offset);
-        offset += chunk.length;
-      }
-      return combined;
     }, []);
 
     // Play all accumulated audio as one continuous sound
     const playAllAudio = useCallback(async () => {
-      if (!isMountedRef.current || totalBytesRef.current === 0 || hasPlayedRef.current) {
+      if (!isMountedRef.current || writeOffsetRef.current === 0 || hasPlayedRef.current) {
+        return;
+      }
+
+      const pcmData = audioBufferRef.current;
+      if (!pcmData) {
+        logger.warn("No audio buffer available for playback");
+        resetState();
         return;
       }
 
@@ -121,25 +124,26 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
       try {
         // Stop any existing playback
         if (soundRef.current) {
-          await soundRef.current.stopAsync().catch(() => {});
-          await soundRef.current.unloadAsync().catch(() => {});
+          await soundRef.current.stopAsync().catch((e) => logger.debug("Error stopping async before play", e));
+          await soundRef.current.unloadAsync().catch((e) => logger.debug("Error unloading async before play", e));
           soundRef.current = null;
         }
 
-        // Combine all audio
-        const pcmData = combineBuffers();
-        const durationMs = Math.round(pcmData.byteLength / SAMPLE_RATE / BYTES_PER_SAMPLE * 1000);
-        
+        // Slice the buffer to actual received size
+        const actualData = pcmData.slice(0, writeOffsetRef.current);
+        const dataLength = actualData.byteLength;
+        const durationMs = Math.round(dataLength / BYTES_PER_MS);
+
         // Create WAV
-        const header = createWavHeader(pcmData.byteLength, SAMPLE_RATE, CHANNELS, 16);
-        const wavData = new Uint8Array(header.byteLength + pcmData.byteLength);
+        const header = createWavHeader(dataLength, SAMPLE_RATE, CHANNELS, 16);
+        const wavData = new Uint8Array(header.byteLength + dataLength);
         wavData.set(header);
-        wavData.set(pcmData, header.byteLength);
+        wavData.set(actualData, header.byteLength);
 
         const wavBase64 = uint8ArrayToBase64(wavData);
         const uri = `data:audio/wav;base64,${wavBase64}`;
 
-        console.log(`[AudioPlayer] Playing COMPLETE response: ${durationMs}ms (${pcmData.byteLength} bytes)`);
+        logger.info(`Playing COMPLETE response: ${durationMs}ms (${dataLength} bytes)`);
 
         // Create and play sound
         const { sound } = await Audio.Sound.createAsync(
@@ -154,10 +158,10 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
         // Handle playback completion
         sound.setOnPlaybackStatusUpdate((status) => {
           if (!isMountedRef.current) return;
-          
+
           if (status.isLoaded && status.didJustFinish) {
-            console.log("[AudioPlayer] Playback FINISHED - user can speak now");
-            sound.unloadAsync().catch(() => {});
+            logger.info("Playback FINISHED - user can speak now");
+            sound.unloadAsync().catch((e) => logger.debug("Error unloading async after finish", e));
             soundRef.current = null;
             isPlayingRef.current = false;
             onPlaybackStatusChange?.(false);
@@ -167,36 +171,50 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
         });
 
       } catch (error) {
-        console.error("[AudioPlayer] Error playing audio:", error);
+        logger.error("Error playing audio:", error);
         isPlayingRef.current = false;
         onPlaybackStatusChange?.(false);
         resetState();
       }
-    }, [combineBuffers, onPlaybackComplete, onPlaybackStatusChange, resetState]);
+    }, [onPlaybackComplete, onPlaybackStatusChange, resetState]);
 
-    // Handle incoming audio chunks - just accumulate, don't play yet
+    // Handle incoming audio chunks - accumulate into single buffer
     useEffect(() => {
       if (!audioBase64) return;
 
       // Convert base64 to raw PCM bytes
       const arrayBuffer = base64ToArrayBuffer(audioBase64);
-      const pcmData = new Uint8Array(arrayBuffer);
-      
-      // Add to buffer
-      audioBufferRef.current.push(pcmData);
-      totalBytesRef.current += pcmData.length;
-      
-      // Just log accumulation, don't play yet
-      const currentMs = Math.round(totalBytesRef.current / SAMPLE_RATE / BYTES_PER_SAMPLE * 1000);
-      if (audioBufferRef.current.length % 10 === 0) {
-        console.log(`[AudioPlayer] Buffering... ${currentMs}ms accumulated`);
+      const chunk = new Uint8Array(arrayBuffer);
+
+      // Initialize buffer on first chunk
+      if (!audioBufferRef.current) {
+        audioBufferRef.current = new Uint8Array(MAX_BUFFER_SIZE);
+      }
+
+      const buffer = audioBufferRef.current;
+      const offset = writeOffsetRef.current;
+
+      // Check if we have space
+      if (offset + chunk.length > MAX_BUFFER_SIZE) {
+        logger.warn(`Audio buffer overflow, dropping ${chunk.length} bytes`);
+        return;
+      }
+
+      // Copy chunk directly into buffer at write offset
+      buffer.set(chunk, offset);
+      writeOffsetRef.current = offset + chunk.length;
+
+      // Log accumulation periodically
+      if (writeOffsetRef.current % 24000 === 0) { // Every ~1 second at 24kHz
+        const currentMs = Math.round(writeOffsetRef.current / BYTES_PER_MS);
+        logger.debug(`Buffering... ${currentMs}ms accumulated`);
       }
     }, [audioBase64]);
 
     // When stream is complete, play all audio
     useEffect(() => {
-      if (isStreamComplete && totalBytesRef.current > 0 && !hasPlayedRef.current) {
-        console.log("[AudioPlayer] Stream complete - playing entire response");
+      if (isStreamComplete && writeOffsetRef.current > 0 && !hasPlayedRef.current) {
+        logger.info("Stream complete - playing entire response");
         playAllAudio();
       }
     }, [isStreamComplete, playAllAudio]);

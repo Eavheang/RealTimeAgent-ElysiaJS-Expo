@@ -4,6 +4,9 @@
  */
 
 import Constants from "expo-constants";
+import { createLogger } from "./logger";
+
+const logger = createLogger("Config");
 
 // WebSocket auth token (optional, required if WS_AUTH_REQUIRED=true on backend)
 export const WS_AUTH_TOKEN = Constants.expoConfig?.extra?.wsAuthToken ||
@@ -48,11 +51,9 @@ export const getWebSocketUrl = (): string => {
 
   // Replace http://dummy with the original protocol
   const protocol = baseUrl.startsWith("wss://") ? "wss://" : "ws://";
-  return `${protocol}${url.host}${url.pathname}${url.search}`;
+  const finalUrl = `${protocol}${url.host}${url.pathname}${url.search}`;
+
+  logger.info("Backend WebSocket URL:", finalUrl);
+
+  return finalUrl;
 };
-
-// For development: you can hardcode your local IP here
-// Uncomment and replace with your actual IP address:
-// export const BACKEND_WS_URL = "ws://192.168.1.100:3000/ws";
-
-console.log("[Config] Backend WebSocket URL:", BACKEND_WS_URL);

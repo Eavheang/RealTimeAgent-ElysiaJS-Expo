@@ -4,12 +4,50 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { getWebSocketUrl } from "../utils/config";
+import { createLogger } from "../utils/logger";
 import { ConnectionState, BackendMessage } from "../types/websocket";
+
+const logger = createLogger("WebSocket");
+
+interface ConnectionError {
+  code: number;
+  reason: string;
+  message: string;
+}
 
 interface UseWebSocketReturn {
   connectionState: ConnectionState;
+  error: ConnectionError | null;
   sendAudio: (audioData: ArrayBuffer | Uint8Array) => void;
   reconnect: () => void;
+}
+
+/**
+ * Get human-readable error message from WebSocket close code
+ */
+function getCloseCodeMessage(code: number, reason: string): { message: string; isRetryable: boolean } {
+  switch (code) {
+    case 1000:
+      return { message: "Connection closed normally", isRetryable: false };
+    case 1001:
+      return { message: "Server is shutting down", isRetryable: true };
+    case 1002:
+      return { message: "Protocol error", isRetryable: false };
+    case 1003:
+      return { message: "Unsupported data type", isRetryable: false };
+    case 1005:
+      return { message: "Connection lost unexpectedly", isRetryable: true };
+    case 1006:
+      return { message: "Network connection lost", isRetryable: true };
+    case 1008:
+      return { message: reason || "Authentication failed or unauthorized", isRetryable: false };
+    case 1009:
+      return { message: "Message too large", isRetryable: false };
+    case 1011:
+      return { message: "Server error occurred", isRetryable: true };
+    default:
+      return { message: reason || "Connection closed", isRetryable: false };
+  }
 }
 
 /**
@@ -20,13 +58,14 @@ export function useWebSocket(
   onAudioDone?: () => void
 ): UseWebSocketReturn {
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
+  const [error, setError] = useState<ConnectionError | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const onAudioReceivedRef = useRef(onAudioReceived);
   const onAudioDoneRef = useRef(onAudioDone);
   const isConnectingRef = useRef(false);
-  
+
   // Update refs when callbacks change
   useEffect(() => {
     onAudioReceivedRef.current = onAudioReceived;
@@ -45,23 +84,27 @@ export function useWebSocket(
     if (wsRef.current?.readyState === WebSocket.CONNECTING) return;
 
     isConnectingRef.current = true;
+    setError(null);
 
     if (wsRef.current) {
-      try { wsRef.current.close(); } catch (e) {}
+      try { wsRef.current.close(); } catch (e) {
+        logger.error("Error closing WebSocket during connect:", e);
+      }
       wsRef.current = null;
     }
 
     const wsUrl = getWebSocketUrl();
-    console.log("[WebSocket] Connecting to:", wsUrl);
+    logger.info("Connecting to:", wsUrl);
     setConnectionState("connecting");
 
     try {
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        console.log("[WebSocket] Connected");
+        logger.info("Connected");
         isConnectingRef.current = false;
         setConnectionState("connected");
+        setError(null);
         reconnectAttemptsRef.current = 0;
 
         if (reconnectTimeoutRef.current) {
@@ -74,44 +117,67 @@ export function useWebSocket(
         try {
           if (typeof event.data === "string") {
             const message: BackendMessage = JSON.parse(event.data);
-            
+
             if (message.type === "audio" && message.data) {
-              console.log("[WebSocket] Received audio chunk");
+              logger.debug("Received audio chunk");
               onAudioReceivedRef.current?.(message.data);
             } else if (message.type === "audio_done") {
-              console.log("[WebSocket] All audio received - stream complete");
+              logger.info("All audio received - stream complete");
               onAudioDoneRef.current?.();
             }
           }
         } catch (error) {
-          console.error("[WebSocket] Error parsing message:", error);
+          logger.error("Error parsing message:", error);
         }
       };
 
       ws.onerror = (error) => {
-        console.error("[WebSocket] Error:", error);
+        logger.error("Error:", error);
         isConnectingRef.current = false;
         setConnectionState("error");
+        setError({ code: 0, reason: "Connection error", message: "Connection error occurred" });
       };
 
       ws.onclose = (event) => {
-        console.log("[WebSocket] Disconnected:", event.code);
+        logger.info("Disconnected:", event.code, event.reason);
         isConnectingRef.current = false;
-        setConnectionState("disconnected");
         wsRef.current = null;
 
-        if (event.code !== 1000 && reconnectAttemptsRef.current < maxReconnectAttempts) {
+        const { message, isRetryable } = getCloseCodeMessage(event.code, event.reason);
+
+        if (event.code === 1000) {
+          // Normal close - don't reconnect
+          setConnectionState("disconnected");
+        } else if (!isRetryable || reconnectAttemptsRef.current >= maxReconnectAttempts) {
+          // Non-retryable error or max attempts reached
+          setConnectionState("error");
+          setError({
+            code: event.code,
+            reason: event.reason,
+            message: reconnectAttemptsRef.current >= maxReconnectAttempts
+              ? "Unable to reconnect after multiple attempts"
+              : message,
+          });
+        } else {
+          // Retryable error - schedule reconnection
+          setConnectionState("disconnected");
+          setError({
+            code: event.code,
+            reason: event.reason,
+            message: `${message}. Reconnecting... (${reconnectAttemptsRef.current + 1}/${maxReconnectAttempts})`,
+          });
           reconnectAttemptsRef.current++;
-          console.log(`[WebSocket] Reconnecting (${reconnectAttemptsRef.current}/${maxReconnectAttempts})...`);
+          logger.info(`Reconnecting (${reconnectAttemptsRef.current}/${maxReconnectAttempts})...`);
           reconnectTimeoutRef.current = setTimeout(connect, reconnectDelay);
         }
       };
 
       wsRef.current = ws;
     } catch (error) {
-      console.error("[WebSocket] Connection error:", error);
+      logger.error("Connection error:", error);
       isConnectingRef.current = false;
       setConnectionState("error");
+      setError({ code: 0, reason: "Failed to connect", message: "Could not establish connection" });
     }
   }, []);
 
@@ -122,7 +188,8 @@ export function useWebSocket(
     try {
       wsRef.current.send(audioData);
     } catch (error) {
-      console.error("[WebSocket] Error sending audio:", error);
+      logger.error("Error sending audio:", error);
+      setError({ code: 0, reason: "Send failed", message: "Could not send audio data" });
     }
   }, []);
 
@@ -132,6 +199,7 @@ export function useWebSocket(
       wsRef.current = null;
     }
     reconnectAttemptsRef.current = 0;
+    setError(null);
     connect();
   }, [connect]);
 
@@ -149,5 +217,5 @@ export function useWebSocket(
     };
   }, [connect]);
 
-  return { connectionState, sendAudio, reconnect };
+  return { connectionState, error, sendAudio, reconnect };
 }
