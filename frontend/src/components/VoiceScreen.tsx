@@ -27,6 +27,19 @@ export function VoiceScreen() {
   const [showError, setShowError] = useState(false);
   const audioPlayerRef = useRef<AudioPlayerHandle>(null);
 
+  // Ref to access current conversationState in callbacks (prevents stale closure)
+  const conversationStateRef = useRef(conversationState);
+  const isSessionActiveRef = useRef(isSessionActive);
+
+  // Keep refs updated
+  useEffect(() => {
+    conversationStateRef.current = conversationState;
+  }, [conversationState]);
+
+  useEffect(() => {
+    isSessionActiveRef.current = isSessionActive;
+  }, [isSessionActive]);
+
   // Handle audio received from backend
   const handleAudioReceived = useCallback((audioBase64: string) => {
     setAudioChunk(audioBase64);
@@ -60,12 +73,17 @@ export function VoiceScreen() {
   }, [reconnect]);
 
   // Audio recording - only send when we're in listening state
+  // Use refs to prevent stale closure issues
   const { isRecording, startRecording, stopRecording, requestPermissions } = useAudioRecording(
     (audioData: ArrayBuffer) => {
       // Only send audio if session active AND we're in idle/listening state
-      if (isSessionActive && (conversationState === "idle" || conversationState === "listening")) {
+      // Using refs ensures we always have current state values
+      const currentSessionActive = isSessionActiveRef.current;
+      const currentState = conversationStateRef.current;
+
+      if (currentSessionActive && (currentState === "idle" || currentState === "listening")) {
         sendAudio(audioData);
-        if (conversationState === "idle") {
+        if (currentState === "idle") {
           setConversationState("listening");
         }
       }

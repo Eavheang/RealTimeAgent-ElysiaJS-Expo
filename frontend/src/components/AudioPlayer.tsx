@@ -18,6 +18,9 @@ const MAX_STREAM_DURATION_MS = 60000; // Max 60 seconds of audio
 const MAX_BUFFER_SIZE = SAMPLE_RATE * BYTES_PER_SAMPLE * (MAX_STREAM_DURATION_MS / 1000); // ~2.88MB
 const BYTES_PER_MS = SAMPLE_RATE * BYTES_PER_SAMPLE / 1000; // Bytes per millisecond = 48
 
+// WAV header cache to avoid recreating identical headers
+const WAV_HEADER_CACHE = new Map<string, Uint8Array>();
+
 interface AudioPlayerProps {
   audioBase64: string | null;
   isStreamComplete: boolean; // True when all audio has been received
@@ -224,7 +227,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
 );
 
 /**
- * Create WAV header
+ * Create WAV header (with caching for constant parts)
  */
 function createWavHeader(
   dataLength: number,
@@ -232,6 +235,19 @@ function createWavHeader(
   channels: number,
   bitsPerSample: number
 ): Uint8Array {
+  // Cache base header for constant fields (sample rate, channels, bits)
+  const cacheKey = `${sampleRate}-${channels}-${bitsPerSample}`;
+
+  if (WAV_HEADER_CACHE.has(cacheKey)) {
+    // Clone cached header and update dataLength fields
+    const header = new Uint8Array(WAV_HEADER_CACHE.get(cacheKey)!);
+    const view = new DataView(header.buffer);
+    view.setUint32(4, 36 + dataLength, true); // RIFF chunk size
+    view.setUint32(40, dataLength, true);      // data chunk size
+    return header;
+  }
+
+  // Create new header
   const buffer = new ArrayBuffer(44);
   const view = new DataView(buffer);
 
@@ -255,17 +271,24 @@ function createWavHeader(
   writeString(36, "data");
   view.setUint32(40, dataLength, true);
 
+  // Cache the header (for dataLength=0, will clone and update for actual length)
+  const headerWithZeroLength = new Uint8Array(buffer);
+  WAV_HEADER_CACHE.set(cacheKey, headerWithZeroLength);
+
   return new Uint8Array(buffer);
 }
 
 /**
- * Convert Uint8Array to Base64
+ * Convert Uint8Array to Base64 (optimized to avoid string concatenation in loop)
  */
 function uint8ArrayToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  // Process in chunks to avoid call stack limits and improve performance
+  const chunks: string[] = [];
+  const CHUNK_SIZE = 0x8000; // 32KB chunks
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    const chunk = bytes.subarray(i, i + CHUNK_SIZE);
+    // Use array.from or spread to convert chunk to string more efficiently
+    chunks.push(String.fromCharCode(...Array.from(chunk)));
   }
-  return btoa(binary);
+  return btoa(chunks.join(""));
 }

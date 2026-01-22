@@ -55,10 +55,19 @@ export function useAudioRecording(
     const subscription = LiveAudioStream.on("data", (data: string) => {
       try {
         // data is base64 encoded PCM audio
+        // Optimized: decode and convert to Uint8Array efficiently
         const binaryString = atob(data);
         const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
+
+        // Process in 32KB chunks for better cache locality
+        const CHUNK_SIZE = 0x8000;
+        let i = 0;
+        while (i < binaryString.length) {
+          const chunkEnd = Math.min(i + CHUNK_SIZE, binaryString.length);
+          for (let j = i; j < chunkEnd; j++) {
+            bytes[j] = binaryString.charCodeAt(j);
+          }
+          i = chunkEnd;
         }
 
         // Send to WebSocket

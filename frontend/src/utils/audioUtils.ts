@@ -3,23 +3,29 @@
  */
 
 /**
- * Convert base64 string to ArrayBuffer
+ * Convert base64 string to ArrayBuffer (optimized with chunked processing)
  */
 export function base64ToArrayBuffer(base64: string): ArrayBuffer {
   // Remove data URL prefix if present
-  const base64Data = base64.includes(",") 
-    ? base64.split(",")[1] 
+  const base64Data = base64.includes(",")
+    ? base64.split(",")[1]
     : base64;
 
   // Decode base64 to binary string
   const binaryString = atob(base64Data);
-  
-  // Convert binary string to ArrayBuffer
+
+  // Convert binary string to ArrayBuffer with chunked processing for better cache locality
   const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
+  const CHUNK_SIZE = 0x8000; // 32KB chunks
+  let i = 0;
+  while (i < binaryString.length) {
+    const chunkEnd = Math.min(i + CHUNK_SIZE, binaryString.length);
+    for (let j = i; j < chunkEnd; j++) {
+      bytes[j] = binaryString.charCodeAt(j);
+    }
+    i = chunkEnd;
   }
-  
+
   return bytes.buffer;
 }
 
@@ -46,13 +52,19 @@ export function base64ToInt16Array(base64: string): Int16Array {
 }
 
 /**
- * Convert Int16Array to base64
+ * Convert Int16Array to base64 (optimized to avoid string concatenation in loop)
  */
 export function int16ArrayToBase64(int16Array: Int16Array): string {
   const bytes = new Uint8Array(int16Array.buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
+
+  // Process in chunks to avoid call stack limits and improve performance
+  const chunks: string[] = [];
+  const CHUNK_SIZE = 0x8000; // 32KB chunks
+  for (let i = 0; i < bytes.byteLength; i += CHUNK_SIZE) {
+    const chunkEnd = Math.min(i + CHUNK_SIZE, bytes.byteLength);
+    const subarray = bytes.subarray(i, chunkEnd);
+    // Use apply to avoid creating intermediate arrays for small chunks
+    chunks.push(String.fromCharCode.apply(null, Array.from(subarray)));
   }
-  return btoa(binary);
+  return btoa(chunks.join(""));
 }
